@@ -23,6 +23,7 @@ import re
 import csv
 import copy
 import json
+import hashlib
 import argparse
 import shutil
 import tempfile
@@ -439,6 +440,29 @@ ALL_SPECIES = [s for species in SPECIES_CATEGORIES.values() for s in species]
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), "CTAG_Annotator")
 SPECIES_CSV = os.path.join(CONFIG_DIR, "species.csv")
 BEHAVIORS_CSV = os.path.join(CONFIG_DIR, "behaviors.csv")
+# Guaranteed-local place for annotations/autosaves — lives in the user's home
+# (NOT inside any cloud-synced mount), so saves work even when the *video* is
+# streamed from Google Drive / iCloud / Dropbox / OneDrive.
+LOCAL_ANNOTATIONS_DIR = os.path.join(CONFIG_DIR, "annotations")
+
+# Substrings that indicate a path lives inside a cloud "file provider" mount,
+# where app writes can silently fail or not sync (the common cause of
+# "my JSON didn't save to the folder").
+_CLOUD_PATH_MARKERS = (
+    "/Library/CloudStorage/",   # Google Drive, OneDrive, Dropbox, Box (modern macOS)
+    "com.apple.CloudDocs",      # iCloud Drive
+    "/Google Drive",            # legacy Google Drive for Desktop mount
+    "GoogleDrive-",
+    "/Dropbox",
+    "/OneDrive",
+    "/My Drive",
+    "/Shared drives",
+)
+
+
+def is_cloud_path(path: str) -> bool:
+    """True if `path` appears to live inside a cloud-synced virtual filesystem."""
+    return any(m in (path or "") for m in _CLOUD_PATH_MARKERS)
 
 
 def _ensure_config_dir():
@@ -1965,6 +1989,9 @@ class MainWindow(QMainWindow):
         a_save = QAction("Save JSON…", self)
         a_save.triggered.connect(self._save_json)
         file_menu.addAction(a_save)
+        a_reveal = QAction("Open Local Annotations Folder", self)
+        a_reveal.triggered.connect(self._open_local_annotations_folder)
+        file_menu.addAction(a_reveal)
 
         help_menu = mb.addMenu("&Help")
         a_help = QAction("Keyboard & usage help", self)
@@ -2804,11 +2831,44 @@ class MainWindow(QMainWindow):
         w.release()
 
     # -------------------------------------------------------- autosave
+    def _source_key(self) -> str:
+        """A filesystem-safe, stable id for the current source (for local autosave)."""
+        base = self.store.video_path or self.video_path or "session"
+        stem = os.path.splitext(os.path.basename(base.rstrip("/")))[0] or "session"
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem)[:60]
+        h = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:8]
+        return f"{stem}_{h}"
+
     def _autosave_path(self) -> str:
+        """Autosave always goes to the guaranteed-local annotations folder, so it
+        works even when the video is streamed from a cloud mount."""
+        os.makedirs(LOCAL_ANNOTATIONS_DIR, exist_ok=True)
+        return os.path.join(LOCAL_ANNOTATIONS_DIR,
+                            self._source_key() + ".autosave.json")
+
+    def _legacy_sidecar_path(self) -> str:
+        """Old autosave location (next to the video) — checked for resume only."""
         base = self.store.video_path or self.video_path
         if base and os.path.isdir(base):
             return os.path.join(base, ".ctag_autosave.json")
         return (base or self.video_path) + ".ctag_autosave.json"
+
+    def _safe_save(self, path: str):
+        """Write the store to `path` and confirm it materialised.
+
+        Returns (ok, error_message).  Catches cloud-mount write failures that
+        would otherwise be silent, and verifies a non-empty file exists after.
+        """
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+            self.store.save_json(path)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                return False, ("File did not appear on disk after writing "
+                               "(the folder may be a cloud mount that rejected "
+                               "the write).")
+            return True, ""
+        except Exception as e:
+            return False, str(e)
 
     def _has_annotations(self) -> bool:
         s = self.store
@@ -2823,11 +2883,11 @@ class MainWindow(QMainWindow):
     def _autosave(self):
         if not self._has_annotations():
             return
-        try:
-            self.store.save_json(self._autosave_path())
-            self.statusBar().showMessage("Autosaved.", 2000)
-        except Exception:
-            pass
+        ok, err = self._safe_save(self._autosave_path())
+        if ok:
+            self.statusBar().showMessage("Autosaved (local).", 2000)
+        else:
+            self.statusBar().showMessage(f"Autosave failed: {err}", 4000)
 
     def _apply_loaded_store(self, loaded: "FeatureStore"):
         """Merge a loaded store's annotations into the current store."""
@@ -2859,8 +2919,14 @@ class MainWindow(QMainWindow):
         self._display_frame(self.current_frame_idx)
 
     def _maybe_resume_autosave(self):
+        if self._has_annotations():
+            return
+        # Prefer the new local autosave; fall back to a legacy sidecar if present.
         p = self._autosave_path()
-        if not os.path.exists(p) or self._has_annotations():
+        if not os.path.exists(p):
+            legacy = self._legacy_sidecar_path()
+            p = legacy if os.path.exists(legacy) else None
+        if not p:
             return
         yes, no = self._std_buttons()
         ret = QMessageBox.question(
@@ -3582,13 +3648,52 @@ class MainWindow(QMainWindow):
 
         return saved
 
+    def _default_save_path(self) -> str:
+        """Where the Save-JSON dialog should start.
+
+        If the video is on a cloud mount, default to the guaranteed-local
+        annotations folder so saves actually persist; otherwise save next to
+        the video as before.
+        """
+        src = self.store.video_path or self.video_path
+        name = (os.path.basename(src.rstrip("/")) or "annotations") + ".annotated.json"
+        if is_cloud_path(src):
+            os.makedirs(LOCAL_ANNOTATIONS_DIR, exist_ok=True)
+            return os.path.join(LOCAL_ANNOTATIONS_DIR, name)
+        return (src or self.video_path) + ".annotated.json"
+
     def _save_json(self):
+        src = self.store.video_path or self.video_path
+        if is_cloud_path(src):
+            self.statusBar().showMessage(
+                "This video is on a cloud drive — saving to your local "
+                "CTAG_Annotator/annotations folder so it persists reliably.")
         p, _ = QFileDialog.getSaveFileName(
-            self, "Save annotations",
-            self.video_path + ".annotated.json", "JSON (*.json)")
-        if p:
-            self.store.save_json(p)
+            self, "Save annotations", self._default_save_path(), "JSON (*.json)")
+        if not p:
+            return
+        ok, err = self._safe_save(p)
+        if ok:
             self.statusBar().showMessage(f"Saved {p}")
+            return
+        # Write failed (or didn't materialise) — fall back to a local copy.
+        fallback = os.path.join(
+            LOCAL_ANNOTATIONS_DIR,
+            os.path.basename(p) or (self._source_key() + ".annotated.json"))
+        ok2, err2 = self._safe_save(fallback)
+        if ok2:
+            QMessageBox.warning(
+                self, "Saved locally instead",
+                f"Couldn't save to:\n{p}\n\n({err})\n\n"
+                f"Saved a local copy here instead:\n{fallback}\n\n"
+                "Tip: keep annotating locally, then upload this JSON to Drive "
+                "via Finder when you're done.")
+            self.statusBar().showMessage(f"Saved local copy: {fallback}")
+        else:
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not save to either location:\n{p}\n({err})\n\n"
+                f"{fallback}\n({err2})")
 
     def _export_video(self):
         if self.playing:
@@ -3869,6 +3974,16 @@ class MainWindow(QMainWindow):
 
         w.release()
 
+    def _open_local_annotations_folder(self):
+        try:
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+        except ImportError:
+            from PyQt5.QtGui import QDesktopServices
+            from PyQt5.QtCore import QUrl
+        os.makedirs(LOCAL_ANNOTATIONS_DIR, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(LOCAL_ANNOTATIONS_DIR))
+
     def _show_help(self):
         QMessageBox.information(
             self, "CTAG Annotator — Help",
@@ -3886,8 +4001,11 @@ class MainWindow(QMainWindow):
             "Other\n"
             "  • ⌘Z / Ctrl+Z: undo.   ← / →: step frames.\n"
             "  • Ctrl and +/- zoom.   Select a feature then Delete to remove it.\n"
-            "  • Work autosaves every 60 s next to the video; you're prompted to\n"
-            "    resume on reopen.  File menu opens other videos / folders.")
+            "  • Work autosaves every 60 s to a LOCAL folder\n"
+            "    (~/CTAG_Annotator/annotations) — reliable even when the video\n"
+            "    is streamed from Google Drive/iCloud. You're prompted to resume\n"
+            "    on reopen. If a cloud save fails, a local copy is kept instead.\n"
+            "  • File menu: open other videos/folders, or reveal that folder.")
 
     # -------------------------------------------------------------- close
     def closeEvent(self, ev):
