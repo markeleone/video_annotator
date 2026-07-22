@@ -10,6 +10,7 @@ a = Analysis(
     hiddenimports=[
         'PyQt6', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets',
         'cv2', 'matplotlib', 'matplotlib.backends.backend_agg',
+        'openpyxl', 'openpyxl.chart', 'openpyxl.styles', 'openpyxl.utils',
     ],
     hookspath=[],
     runtime_hooks=[],

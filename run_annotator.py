@@ -20,6 +20,8 @@ Usage:
 import sys
 import os
 import re
+import csv
+import copy
 import json
 import argparse
 import shutil
@@ -41,6 +43,7 @@ try:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
+        QScrollArea,
     )
     _QT6 = True
 except ImportError:
@@ -51,6 +54,7 @@ except ImportError:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
+        QScrollArea,
     )
     _QT6 = False
 
@@ -58,17 +62,39 @@ except ImportError:
 # Modern UI constants
 # --------------------------------------------------------------------------
 
-BEHAVIOR_OPTIONS = [
-    "1 - Burst swimming",
-    "2 - Low-speed swimming",
-    "3 - Stationary (alone)",
-    "4 - Foraging",
-    "5 - Following a shark",
-    "6 - Shark following tagged",
-    "7 - Parallel swimming",
-    "8 - Brief interaction",
-    "9 - Stationary with 1+ sharks",
+# Behavior is split into two INDEPENDENT axes so a shark can be doing a
+# movement (e.g. Foraging) *and* a social interaction (e.g. Parallel swimming)
+# at the same time.  Both axes persist-until-changed, exactly like habitat.
+# These lists are only the *defaults* used to seed behaviors.csv on first run;
+# at runtime the app uses whatever is in the CSV (see load_behaviors()).
+MOVEMENT_OPTIONS_DEFAULT = [
+    "Burst swimming",
+    "Low-speed swimming",
+    "Stationary",
+    "Foraging",
+    "Turn",
 ]
+
+SOCIAL_OPTIONS_DEFAULT = [
+    "Solo",
+    "Parallel swimming",
+    "Following a shark",
+    "Shark following tagged",
+    "Brief interaction",
+    "With 1+ sharks",
+]
+
+# Runtime lists (populated from CSV in main(); fall back to the defaults).
+MOVEMENT_OPTIONS = list(MOVEMENT_OPTIONS_DEFAULT)
+SOCIAL_OPTIONS = list(SOCIAL_OPTIONS_DEFAULT)
+
+# Water visibility — its own persist-until-changed axis, so each stretch of
+# footage carries how observable interactions/substrate were.
+VISIBILITY_OPTIONS = ["Good", "Moderate", "Poor"]
+
+# Per-feature metadata option lists
+CONFIDENCE_OPTIONS = ["", "High", "Medium", "Low"]
+SEX_OPTIONS = ["", "Male", "Female", "Unknown"]
 
 HABITAT_OPTIONS = ["Mangrove", "Rocky reef", "Sandy bottom", "Gravel", "Mud"]
 
@@ -396,7 +422,147 @@ SPECIES_CATEGORIES = {
     ],
     "Other": [],
 }
+# Snapshot of the built-in taxonomy, used to seed species.csv on first run.
+SPECIES_CATEGORIES_DEFAULT = {cat: list(sps) for cat, sps in SPECIES_CATEGORIES.items()}
+# Category display order (also the Category dropdown order).
+SPECIES_CATEGORY_ORDER = list(SPECIES_CATEGORIES.keys())
 ALL_SPECIES = [s for species in SPECIES_CATEGORIES.values() for s in species]
+
+
+# --------------------------------------------------------------------------
+# User-editable label config (species + behaviors) — no code edits needed
+# --------------------------------------------------------------------------
+# On first launch we seed CSV files under ~/CTAG_Annotator from the built-in
+# defaults.  Researchers can edit those CSVs directly, or use the in-app
+# "＋ Add" buttons which append to them live.
+
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), "CTAG_Annotator")
+SPECIES_CSV = os.path.join(CONFIG_DIR, "species.csv")
+BEHAVIORS_CSV = os.path.join(CONFIG_DIR, "behaviors.csv")
+
+
+def _ensure_config_dir():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+
+def _seed_species_csv():
+    _ensure_config_dir()
+    with open(SPECIES_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["category", "species"])
+        for cat in SPECIES_CATEGORY_ORDER:
+            sps = SPECIES_CATEGORIES_DEFAULT.get(cat, [])
+            if sps:
+                for s in sps:
+                    w.writerow([cat, s])
+            else:
+                w.writerow([cat, ""])   # keep the category even with no species
+
+
+def _seed_behaviors_csv():
+    _ensure_config_dir()
+    with open(BEHAVIORS_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["axis", "label"])
+        for lab in MOVEMENT_OPTIONS_DEFAULT:
+            w.writerow(["movement", lab])
+        for lab in SOCIAL_OPTIONS_DEFAULT:
+            w.writerow(["social", lab])
+
+
+def load_species_config():
+    """Return an ordered {category: [species,...]} dict from species.csv.
+
+    Seeds the CSV from the built-in taxonomy on first run.  Always keeps the
+    standard categories present (in order) so the UI stays predictable.
+    """
+    if not os.path.exists(SPECIES_CSV):
+        try:
+            _seed_species_csv()
+        except OSError:
+            return {cat: list(sps) for cat, sps in SPECIES_CATEGORIES_DEFAULT.items()}
+
+    cats: Dict[str, list] = {}
+    try:
+        with open(SPECIES_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                cat = (row.get("category") or "").strip()
+                sp = (row.get("species") or "").strip()
+                if not cat:
+                    continue
+                cats.setdefault(cat, [])
+                if sp and sp not in cats[cat]:
+                    cats[cat].append(sp)
+    except (OSError, csv.Error):
+        return {cat: list(sps) for cat, sps in SPECIES_CATEGORIES_DEFAULT.items()}
+
+    # Guarantee the standard categories exist and lead, preserving CSV order
+    # for any extra categories the user added.
+    ordered: Dict[str, list] = {}
+    for cat in SPECIES_CATEGORY_ORDER:
+        ordered[cat] = cats.pop(cat, [])
+    ordered.update(cats)
+    return ordered
+
+
+def load_behaviors_config():
+    """Return (movement_list, social_list) from behaviors.csv, seeding first run."""
+    if not os.path.exists(BEHAVIORS_CSV):
+        try:
+            _seed_behaviors_csv()
+        except OSError:
+            return list(MOVEMENT_OPTIONS_DEFAULT), list(SOCIAL_OPTIONS_DEFAULT)
+
+    movement, social = [], []
+    try:
+        with open(BEHAVIORS_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                axis = (row.get("axis") or "").strip().lower()
+                lab = (row.get("label") or "").strip()
+                if not lab:
+                    continue
+                if axis == "movement" and lab not in movement:
+                    movement.append(lab)
+                elif axis == "social" and lab not in social:
+                    social.append(lab)
+    except (OSError, csv.Error):
+        return list(MOVEMENT_OPTIONS_DEFAULT), list(SOCIAL_OPTIONS_DEFAULT)
+
+    return (movement or list(MOVEMENT_OPTIONS_DEFAULT),
+            social or list(SOCIAL_OPTIONS_DEFAULT))
+
+
+def append_species_to_csv(category: str, species: str):
+    """Append one (category, species) row to species.csv (best effort)."""
+    _ensure_config_dir()
+    write_header = not os.path.exists(SPECIES_CSV)
+    with open(SPECIES_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["category", "species"])
+        w.writerow([category, species])
+
+
+def append_behavior_to_csv(axis: str, label: str):
+    """Append one (axis, label) row to behaviors.csv (best effort)."""
+    _ensure_config_dir()
+    write_header = not os.path.exists(BEHAVIORS_CSV)
+    with open(BEHAVIORS_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["axis", "label"])
+        w.writerow([axis, label])
+
+
+def load_all_label_config():
+    """Populate the runtime global label lists from the CSV config files."""
+    global SPECIES_CATEGORIES, SPECIES_CATEGORY_ORDER, ALL_SPECIES
+    global MOVEMENT_OPTIONS, SOCIAL_OPTIONS
+    SPECIES_CATEGORIES = load_species_config()
+    SPECIES_CATEGORY_ORDER = list(SPECIES_CATEGORIES.keys())
+    ALL_SPECIES = [s for sps in SPECIES_CATEGORIES.values() for s in sps]
+    MOVEMENT_OPTIONS, SOCIAL_OPTIONS = load_behaviors_config()
+
 
 # Modern-ish palette (RGB) for tracked features
 FEATURE_COLORS = [
@@ -438,8 +604,8 @@ QLabel#BarTitle {
 QLineEdit, QComboBox, QDoubleSpinBox {
   background: #FFFFFF;
   border: 1px solid #D1D5DB;
-  border-radius: 10px;
-  padding: 7px 10px;
+  border-radius: 8px;
+  padding: 4px 8px;
 }
 
 QComboBox::drop-down {
@@ -454,8 +620,8 @@ QPushButton {
   background: #111827;
   color: #FFFFFF;
   border: none;
-  border-radius: 12px;
-  padding: 9px 12px;
+  border-radius: 9px;
+  padding: 5px 10px;
   font-weight: 600;
 }
 QPushButton:hover { background: #0B1220; }
@@ -473,7 +639,7 @@ QToolButton[segmented="true"] {
   background: #F1F5F9;
   border: 1px solid #E2E8F0;
   border-radius: 999px;
-  padding: 7px 12px;
+  padding: 3px 9px;
   font-weight: 600;
   color: #0F172A;
 }
@@ -519,7 +685,9 @@ class TrackedFeature:
     color_idx: int = 0
     count: int = 1
     species_category: str = ""  # Shark / Ray / Teleost fish / Sea turtle / Other
-    species: str = ""           # specific species name, optional
+    species: str = ""           # specific species name (or family, for hard IDs)
+    confidence: str = ""        # "" | High | Medium | Low
+    sex: str = ""               # "" | Male | Female | Unknown
 
 
 class FeatureStore:
@@ -538,9 +706,18 @@ class FeatureStore:
         self.feature_bboxes: List[Dict[int, Tuple[int, int, int, int]]] = []
         self._next_color = 0
 
-        # per-frame scene labels (persist until changed)
-        self.behavior_per_frame: List[Optional[str]] = [None] * total_frames
+        # per-frame scene labels (persist until changed).  Behavior is two
+        # independent axes: movement + social/interaction.
+        self.movement_per_frame: List[Optional[str]] = [None] * total_frames
+        self.social_per_frame: List[Optional[str]] = [None] * total_frames
         self.habitat_per_frame: List[Optional[str]] = [None] * total_frames
+        self.visibility_per_frame: List[Optional[str]] = [None] * total_frames
+
+        # timestamped notes: list of {"frame": int, "text": str}
+        self.notes: List[Dict] = []
+
+        # saved highlight clips: list of {"name": str, "start": int, "end": int}
+        self.clips: List[Dict] = []
 
     def add_feature(self, feat: TrackedFeature,
                     masks: Dict[int, np.ndarray],
@@ -567,13 +744,34 @@ class FeatureStore:
                 out.append((i, feat, mask, bbox))
         return out
 
-    def set_behavior(self, frame_idx: int, label: Optional[str]):
+    def set_movement(self, frame_idx: int, label: Optional[str]):
         if 0 <= frame_idx < self.total_frames:
-            self.behavior_per_frame[frame_idx] = label
+            self.movement_per_frame[frame_idx] = label
+
+    def set_social(self, frame_idx: int, label: Optional[str]):
+        if 0 <= frame_idx < self.total_frames:
+            self.social_per_frame[frame_idx] = label
 
     def set_habitat(self, frame_idx: int, label: Optional[str]):
         if 0 <= frame_idx < self.total_frames:
             self.habitat_per_frame[frame_idx] = label
+
+    def set_visibility(self, frame_idx: int, label: Optional[str]):
+        if 0 <= frame_idx < self.total_frames:
+            self.visibility_per_frame[frame_idx] = label
+
+    def add_note(self, frame_idx: int, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+        self.notes.append({"frame": int(frame_idx), "text": text})
+        self.notes.sort(key=lambda n: n["frame"])
+
+    def remove_note(self, note: Dict):
+        try:
+            self.notes.remove(note)
+        except ValueError:
+            pass
 
     @staticmethod
     def _compress_timeline(labels: List[Optional[str]]):
@@ -599,9 +797,13 @@ class FeatureStore:
             "video_w": self.video_w,
             "video_h": self.video_h,
             "scene": {
-                "behavior_segments": self._compress_timeline(self.behavior_per_frame),
+                "movement_segments": self._compress_timeline(self.movement_per_frame),
+                "social_segments": self._compress_timeline(self.social_per_frame),
                 "habitat_segments": self._compress_timeline(self.habitat_per_frame),
+                "visibility_segments": self._compress_timeline(self.visibility_per_frame),
             },
+            "notes": [dict(n) for n in self.notes],
+            "clips": [dict(c) for c in self.clips],
             "features": [],
         }
         for i, feat in enumerate(self.features):
@@ -615,6 +817,8 @@ class FeatureStore:
                 "count": feat.count,
                 "species_category": feat.species_category,
                 "species": feat.species,
+                "confidence": feat.confidence,
+                "sex": feat.sex,
                 "bboxes": {str(k): list(v) for k, v in self.feature_bboxes[i].items()},
             })
         with open(path, "w") as f:
@@ -635,13 +839,39 @@ class FeatureStore:
         )
 
         scene = data.get("scene", {})
-        # Support both new field names and old field names for backward compatibility
-        for seg in scene.get("behavior_segments", scene.get("environment_segments", [])):
-            for fi in range(int(seg["start"]), int(seg["end"]) + 1):
-                store.set_behavior(fi, seg.get("value"))
-        for seg in scene.get("habitat_segments", scene.get("substrate_segments", [])):
-            for fi in range(int(seg["start"]), int(seg["end"]) + 1):
-                store.set_habitat(fi, seg.get("value"))
+
+        def _apply(segments, setter):
+            for seg in segments or []:
+                for fi in range(int(seg["start"]), int(seg["end"]) + 1):
+                    setter(fi, seg.get("value"))
+
+        # New two-axis schema.  Old files had a single "behavior_segments"
+        # (or legacy "environment_segments") — fold those into the movement
+        # axis so no annotation is lost.
+        _apply(scene.get("movement_segments",
+                         scene.get("behavior_segments",
+                                   scene.get("environment_segments", []))),
+               store.set_movement)
+        _apply(scene.get("social_segments", []), store.set_social)
+        _apply(scene.get("habitat_segments", scene.get("substrate_segments", [])),
+               store.set_habitat)
+        _apply(scene.get("visibility_segments", []), store.set_visibility)
+
+        for nd in data.get("notes", []):
+            try:
+                store.notes.append({"frame": int(nd["frame"]),
+                                    "text": str(nd.get("text", ""))})
+            except (KeyError, ValueError, TypeError):
+                continue
+        store.notes.sort(key=lambda n: n["frame"])
+
+        for cd in data.get("clips", []):
+            try:
+                store.clips.append({"name": str(cd.get("name", "clip")),
+                                    "start": int(cd["start"]),
+                                    "end": int(cd["end"])})
+            except (KeyError, ValueError, TypeError):
+                continue
 
         for fd in data.get("features", []):
             feat = TrackedFeature(
@@ -654,6 +884,8 @@ class FeatureStore:
                 count=int(fd.get("count", 1)),
                 species_category=fd.get("species_category", fd.get("feature_type", "")),
                 species=fd.get("species", ""),
+                confidence=fd.get("confidence", ""),
+                sex=fd.get("sex", ""),
             )
             bboxes_raw = fd.get("bboxes", {})
             bboxes: Dict[int, Tuple[int, int, int, int]] = {
@@ -673,21 +905,37 @@ class FeatureStore:
 
 class VideoLabel(QLabel):
     pointClicked = pyqtSignal(object)           # QPoint
-    bboxDrawn = pyqtSignal(object, object)      # QPoint, QPoint
+    bboxDrawn = pyqtSignal(object, object)      # two-click: start,end (label coords)
+    bboxEdited = pyqtSignal(int, int, int, int)  # edited box (label coords)
+    zoomRequested = pyqtSignal(int, object)      # wheel delta, anchor QPoint
+
+    HANDLE = 9  # corner-handle hit radius / draw size (px)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self._drawing = False
-        self._start = None
-        self._end = None
-        self._is_drag = False
         self._bbox_mode = False
+        # two-click drawing state
+        self._first_corner = None       # QPoint (label coords) or None
+        self._cursor_pos = None
+        # corner-edit state
+        self._edit_rect = None          # [x1,y1,x2,y2] label coords of selected box
+        self._active_handle = None      # 0..3 corner index, "move", or None
+        self._drag_origin = None
 
+    # -- modes ------------------------------------------------------------
     def set_bbox_mode(self, on: bool):
         self._bbox_mode = on
-        cursor = Qt.CursorShape.CrossCursor if (_QT6 and on) else (Qt.CrossCursor if on else Qt.ArrowCursor) if not _QT6 else Qt.CursorShape.ArrowCursor
-        self.setCursor(cursor)
+        self._first_corner = None
+        cross = Qt.CursorShape.CrossCursor if _QT6 else Qt.CrossCursor
+        arrow = Qt.CursorShape.ArrowCursor if _QT6 else Qt.ArrowCursor
+        self.setCursor(cross if on else arrow)
+        self.update()
+
+    def set_edit_rect(self, rect):
+        """Set the selected feature's box (label coords) for corner editing."""
+        self._edit_rect = list(rect) if rect else None
+        self.update()
 
     def set_frame_pixmap(self, pix):
         self.setPixmap(pix)
@@ -698,42 +946,141 @@ class VideoLabel(QLabel):
             return ev.position().toPoint()
         return ev.pos()
 
+    # -- hit testing ------------------------------------------------------
+    def _handle_at(self, pos):
+        if not self._edit_rect:
+            return None
+        x1, y1, x2, y2 = self._edit_rect
+        corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        for i, (cx, cy) in enumerate(corners):
+            if abs(pos.x() - cx) <= self.HANDLE and abs(pos.y() - cy) <= self.HANDLE:
+                return i
+        if min(x1, x2) <= pos.x() <= max(x1, x2) and \
+           min(y1, y2) <= pos.y() <= max(y1, y2):
+            return "move"
+        return None
+
+    # -- mouse ------------------------------------------------------------
     def mousePressEvent(self, ev):
         btn = Qt.MouseButton.LeftButton if _QT6 else Qt.LeftButton
-        if self._bbox_mode and ev.button() == btn:
-            self._drawing = True
-            self._start = self._ev_pos(ev)
-            self._end = self._start
-            self._is_drag = False
+        rbtn = Qt.MouseButton.RightButton if _QT6 else Qt.RightButton
+        pos = self._ev_pos(ev)
+
+        if ev.button() == rbtn:
+            # right-click cancels an in-progress draw
+            self._first_corner = None
             self.update()
+            return
+
+        if ev.button() != btn:
+            return
+
+        if self._bbox_mode:
+            if self._first_corner is None:
+                self._first_corner = pos
+                self._cursor_pos = pos
+            else:
+                self.bboxDrawn.emit(self._first_corner, pos)
+                self._first_corner = None
+            self.update()
+            return
+
+        # not drawing → maybe editing a selected box
+        h = self._handle_at(pos)
+        if h is not None:
+            self._active_handle = h
+            self._drag_origin = pos
 
     def mouseMoveEvent(self, ev):
-        if self._drawing:
-            self._end = self._ev_pos(ev)
-            if (abs(self._end.x() - self._start.x()) > 5 or
-                    abs(self._end.y() - self._start.y()) > 5):
-                self._is_drag = True
+        pos = self._ev_pos(ev)
+        if self._bbox_mode and self._first_corner is not None:
+            self._cursor_pos = pos
             self.update()
+            return
+        if self._active_handle is not None and self._edit_rect is not None:
+            self._drag_handle(pos)
+            self.update()
+            return
+        # hover cursor feedback over edit handles
+        if not self._bbox_mode and self._edit_rect is not None:
+            h = self._handle_at(pos)
+            if h == "move":
+                self.setCursor(Qt.CursorShape.SizeAllCursor if _QT6 else Qt.SizeAllCursor)
+            elif h is not None:
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor if _QT6 else Qt.SizeFDiagCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor if _QT6 else Qt.ArrowCursor)
+
+    def _drag_handle(self, pos):
+        x1, y1, x2, y2 = self._edit_rect
+        if self._active_handle == "move":
+            dx = pos.x() - self._drag_origin.x()
+            dy = pos.y() - self._drag_origin.y()
+            self._edit_rect = [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
+            self._drag_origin = pos
+        else:
+            # move only the dragged corner
+            corners = [[x1, y1], [x2, y1], [x2, y2], [x1, y1]]
+            i = self._active_handle
+            if i == 0:
+                self._edit_rect = [pos.x(), pos.y(), x2, y2]
+            elif i == 1:
+                self._edit_rect = [x1, pos.y(), pos.x(), y2]
+            elif i == 2:
+                self._edit_rect = [x1, y1, pos.x(), pos.y()]
+            elif i == 3:
+                self._edit_rect = [pos.x(), y1, x2, pos.y()]
 
     def mouseReleaseEvent(self, ev):
-        btn = Qt.MouseButton.LeftButton if _QT6 else Qt.LeftButton
-        if ev.button() == btn and self._drawing:
-            self._drawing = False
-            self._end = self._ev_pos(ev)
-            if self._is_drag:
-                self.bboxDrawn.emit(self._start, self._end)
-            self._start = self._end = None
-            self.update()
+        if self._active_handle is not None and self._edit_rect is not None:
+            x1, y1, x2, y2 = self._edit_rect
+            self.bboxEdited.emit(int(min(x1, x2)), int(min(y1, y2)),
+                                 int(max(x1, x2)), int(max(y1, y2)))
+            self._active_handle = None
+            self._drag_origin = None
+
+    def wheelEvent(self, ev):
+        mods = ev.modifiers()
+        ctrl = Qt.KeyboardModifier.ControlModifier if _QT6 else Qt.ControlModifier
+        meta = Qt.KeyboardModifier.MetaModifier if _QT6 else Qt.MetaModifier
+        if mods & ctrl or mods & meta:
+            delta = ev.angleDelta().y()
+            pos = ev.position().toPoint() if _QT6 else ev.pos()
+            self.zoomRequested.emit(delta, pos)
+            ev.accept()
+        else:
+            super().wheelEvent(ev)
 
     def paintEvent(self, ev):
         super().paintEvent(ev)
-        if self._drawing and self._start and self._end and self._is_drag:
-            p = QPainter(self)
-            pen_style = Qt.PenStyle.SolidLine if _QT6 else Qt.SolidLine
-            p.setPen(QPen(QColor(79, 70, 229), 2, pen_style))
-            x1, y1 = self._start.x(), self._start.y()
-            x2, y2 = self._end.x(), self._end.y()
+        p = QPainter(self)
+        if _QT6:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen_solid = Qt.PenStyle.SolidLine if _QT6 else Qt.SolidLine
+        no_pen = Qt.PenStyle.NoPen if _QT6 else Qt.NoPen
+
+        # two-click preview
+        if self._bbox_mode and self._first_corner is not None and self._cursor_pos:
+            p.setPen(QPen(QColor(79, 70, 229), 2, pen_solid))
+            x1, y1 = self._first_corner.x(), self._first_corner.y()
+            x2, y2 = self._cursor_pos.x(), self._cursor_pos.y()
             p.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+            p.setPen(no_pen)
+            p.setBrush(QColor(79, 70, 229))
+            p.drawEllipse(x1 - 4, y1 - 4, 8, 8)
+
+        # edit handles on the selected box
+        if self._edit_rect is not None and not self._bbox_mode:
+            x1, y1, x2, y2 = self._edit_rect
+            p.setPen(QPen(QColor(16, 185, 129), 2, pen_solid))
+            p.setBrush(Qt.BrushStyle.NoBrush if _QT6 else Qt.NoBrush)
+            p.drawRect(int(min(x1, x2)), int(min(y1, y2)),
+                       int(abs(x2 - x1)), int(abs(y2 - y1)))
+            p.setBrush(QColor(16, 185, 129))
+            p.setPen(QPen(QColor(255, 255, 255), 1, pen_solid))
+            hs = self.HANDLE
+            for cx, cy in [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]:
+                p.drawRect(int(cx - hs / 2), int(cy - hs / 2), hs, hs)
 
 
 # --------------------------------------------------------------------------
@@ -757,6 +1104,9 @@ class AnnotationTimeline(QWidget):
         self.total_frames = max(1, int(total_frames))
         self.current_frame = 0
         self._dragging = False
+        # highlight-clip in/out marks (set by MainWindow)
+        self.clip_in = None
+        self.clip_out = None
 
         # Size policy compatibility
         try:
@@ -767,15 +1117,21 @@ class AnnotationTimeline(QWidget):
             fixed = QSizePolicy.Fixed
 
         self.setSizePolicy(exp, fixed)
-        self.setMinimumHeight(160)
+        self.setMinimumHeight(142)
+        self.setMaximumHeight(150)
         self.setMouseTracking(True)
 
-        # Colors for behavior segments — cycle through FEATURE_COLORS palette
-        self._behavior_colors = {
+        # Colors for movement + social segments — cycle FEATURE_COLORS palette
+        self._movement_colors = {
             opt: QColor(*FEATURE_COLORS[i % len(FEATURE_COLORS)])
-            for i, opt in enumerate(BEHAVIOR_OPTIONS)
+            for i, opt in enumerate(MOVEMENT_OPTIONS)
         }
-        self._behavior_colors[None] = QColor(203, 213, 225)
+        self._movement_colors[None] = QColor(203, 213, 225)
+        self._social_colors = {
+            opt: QColor(*FEATURE_COLORS[(i + 3) % len(FEATURE_COLORS)])
+            for i, opt in enumerate(SOCIAL_OPTIONS)
+        }
+        self._social_colors[None] = QColor(203, 213, 225)
 
         # Colors for habitat segments
         self._habitat_colors = {
@@ -784,6 +1140,14 @@ class AnnotationTimeline(QWidget):
             "Sandy bottom": QColor(245, 158, 11),
             "Gravel": QColor(156, 163, 175),
             "Mud": QColor(120, 100, 80),
+            None: QColor(203, 213, 225),
+        }
+
+        # Colors for visibility segments
+        self._visibility_colors = {
+            "Good": QColor(34, 197, 94),
+            "Moderate": QColor(245, 158, 11),
+            "Poor": QColor(239, 68, 68),
             None: QColor(203, 213, 225),
         }
 
@@ -859,13 +1223,15 @@ class AnnotationTimeline(QWidget):
             p.setRenderHint(QPainter.TextAntialiasing, True)
 
         label_w, x0, x1, w = self._bar_geometry()
-        top = 10
-        row_h = 22
-        gap = 10
+        top = 3
+        row_h = 17
+        gap = 3
 
-        behavior_y = top
-        habitat_y = behavior_y + row_h + gap
-        animals_y = habitat_y + row_h + gap
+        movement_y = top
+        social_y = movement_y + row_h + gap
+        habitat_y = social_y + row_h + gap
+        visibility_y = habitat_y + row_h + gap
+        animals_y = visibility_y + row_h + gap
         scrub_y = animals_y + row_h + gap
 
         # Background
@@ -874,10 +1240,10 @@ class AnnotationTimeline(QWidget):
         def draw_left_label(text: str, y: int):
             p.setPen(QColor(15, 23, 42))
             f = p.font()
-            f.setPointSize(14)
+            f.setPointSize(11)
             f.setBold(True)
             p.setFont(f)
-            p.drawText(14, y + row_h - 5, text)
+            p.drawText(14, y + row_h - 4, text)
 
         def draw_bar_outline(y: int):
             p.setPen(QPen(QColor(148, 163, 184), 1))
@@ -910,15 +1276,25 @@ class AnnotationTimeline(QWidget):
                     p.setFont(ff)
                     p.drawText(x_s + 8, row_y + row_h - 6, lbl)
 
-        # --- Behavior row
-        draw_left_label("Behavior", behavior_y)
-        behavior_labels = self.store.behavior_per_frame if self.store is not None else None
-        draw_segment_row(behavior_y, behavior_labels, self._behavior_colors)
+        # --- Movement row
+        draw_left_label("Movement", movement_y)
+        movement_labels = self.store.movement_per_frame if self.store is not None else None
+        draw_segment_row(movement_y, movement_labels, self._movement_colors)
+
+        # --- Social row
+        draw_left_label("Social", social_y)
+        social_labels = self.store.social_per_frame if self.store is not None else None
+        draw_segment_row(social_y, social_labels, self._social_colors)
 
         # --- Habitat row
         draw_left_label("Habitat", habitat_y)
         habitat_labels = self.store.habitat_per_frame if self.store is not None else None
         draw_segment_row(habitat_y, habitat_labels, self._habitat_colors)
+
+        # --- Visibility row
+        draw_left_label("Visibility", visibility_y)
+        visibility_labels = self.store.visibility_per_frame if self.store is not None else None
+        draw_segment_row(visibility_y, visibility_labels, self._visibility_colors)
 
         # --- Other animals row
         draw_left_label("Features:", animals_y)
@@ -982,14 +1358,39 @@ class AnnotationTimeline(QWidget):
         mid_y = scrub_y + row_h // 2
         p.drawLine(x0 + 8, mid_y, x0 + w - 8, mid_y)
 
+        # saved highlight clips (amber bands) + current in/out (indigo band)
+        def _fx(frame):
+            return int(x0 + (frame / max(1, self.total_frames)) * w)
+
+        if self.store is not None:
+            p.setPen(Qt.PenStyle.NoPen if _QT6 else Qt.NoPen)
+            for c in getattr(self.store, "clips", []):
+                xs, xe = _fx(c["start"]), _fx(c["end"] + 1)
+                p.setBrush(QColor(245, 158, 11, 90))
+                p.drawRoundedRect(xs, scrub_y + 2, max(2, xe - xs), row_h - 4, 4, 4)
+
+        if self.clip_in is not None or self.clip_out is not None:
+            a = self.clip_in if self.clip_in is not None else self.clip_out
+            b = self.clip_out if self.clip_out is not None else self.clip_in
+            a, b = min(a, b), max(a, b)
+            xs, xe = _fx(a), _fx(b + 1)
+            p.setPen(Qt.PenStyle.NoPen if _QT6 else Qt.NoPen)
+            p.setBrush(QColor(79, 70, 229, 80))
+            p.drawRoundedRect(xs, scrub_y + 2, max(2, xe - xs), row_h - 4, 4, 4)
+            p.setPen(QPen(QColor(79, 70, 229), 2))
+            for m in (self.clip_in, self.clip_out):
+                if m is not None:
+                    mx = _fx(m)
+                    p.drawLine(mx, scrub_y, mx, scrub_y + row_h)
+
         # Cursor line + knob
         cx = self._frame_to_x(self.current_frame, x0, w)
         p.setPen(QPen(QColor(15, 23, 42), 2))
-        p.drawLine(cx, behavior_y, cx, scrub_y + row_h)
+        p.drawLine(cx, movement_y, cx, scrub_y + row_h)
 
         p.setBrush(QColor(15, 23, 42))
         p.setPen(Qt.PenStyle.NoPen if _QT6 else Qt.NoPen)
-        p.drawEllipse(cx - 14, mid_y - 14, 28, 28)
+        p.drawEllipse(cx - 9, mid_y - 9, 18, 18)
 
         # Time labels
         p.setPen(QColor(100, 116, 139))
@@ -1010,11 +1411,7 @@ class AnnotationTimeline(QWidget):
         p.setPen(QColor(15, 23, 42))
         cur_w = p.fontMetrics().horizontalAdvance(cur_t)
         tx = max(x0, min(cx - cur_w // 2, x0 + w - cur_w))
-        p.drawText(tx, scrub_y - 6, cur_t)
-
-        # little "Frame counts" label like screenshot vibe
-        p.setPen(QColor(100, 116, 139))
-        p.drawText(x0, scrub_y + row_h + 32, "Frame counts")
+        p.drawText(tx, scrub_y - 5, cur_t)
 
 
 # --------------------------------------------------------------------------
@@ -1070,10 +1467,28 @@ class MainWindow(QMainWindow):
             self.store = FeatureStore(store_path, self.fps,
                                       self.total_frames, self.video_w, self.video_h)
 
-        # behavior/habitat selection (persist-until-changed)
-        self._current_behavior = BEHAVIOR_OPTIONS[0]
+        # scene-label selection (persist-until-changed) across all axes
+        self._current_movement = MOVEMENT_OPTIONS[0]
+        self._current_social = SOCIAL_OPTIONS[0]
         self._current_habitat = HABITAT_OPTIONS[0]
+        self._current_visibility = VISIBILITY_OPTIONS[0]
         self._type_counters: Dict[str, int] = {}
+
+        # selection + editing
+        self._selected_feature_idx: Optional[int] = None
+        # zoom viewport (view rect of the full-res frame currently shown)
+        self._zoom = 1.0
+        self._zoom_cx = self.video_w / 2.0
+        self._zoom_cy = self.video_h / 2.0
+        self._view = None  # (vx, vy, vw, vh, pw, ph, ox, oy) set on each display
+
+        # undo stack of state snapshots (discrete actions only)
+        self._undo_stack: List[dict] = []
+        self._undo_limit = 40
+
+        # highlight-clip in/out marks
+        self._clip_in: Optional[int] = None
+        self._clip_out: Optional[int] = None
 
         # playback speed
         self._play_speed = 1.0
@@ -1083,11 +1498,26 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.setInterval(max(1, int(1000 / self.fps)))
 
+        # autosave timer (sidecar JSON next to the source)
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(self._autosave)
+        self.autosave_timer.start(60_000)  # every 60s
+
         self._build_ui()
         self.seek_to(0)
+        # Offer to resume a prior autosave for this source (unless preloaded)
+        if preloaded_store is None:
+            self._maybe_resume_autosave()
 
     # ------------------------------------------------------------------ UI
-    def _make_segment_bar(self, title: str, options: List[str], on_select, rows: int = 1):
+    def _make_segment_bar(self, title: str, options: List[str], on_select,
+                          rows: int = 1, on_add=None):
+        """Build a single-row segmented button bar.
+
+        Returns (container, btns_dict, append_fn).  append_fn(label) adds a new
+        option button live (used by the in-app "＋ Add" flow).  If on_add is
+        given, a trailing "＋" button invokes it.
+        """
         container = QWidget()
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1100,41 +1530,50 @@ class MainWindow(QMainWindow):
 
         group = QButtonGroup(self)
         group.setExclusive(True)
-        btns = {}
+        btns: Dict[str, QToolButton] = {}
 
-        # Split options across rows evenly
-        import math
-        per_row = math.ceil(len(options) / rows)
-        chunks = [options[i:i+per_row] for i in range(0, len(options), per_row)]
+        hl = QHBoxLayout()
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+        lab = QLabel(title)
+        lab.setObjectName("BarTitle")
+        hl.addWidget(lab)
 
-        for r, chunk in enumerate(chunks):
-            hl = QHBoxLayout()
-            hl.setContentsMargins(0, 0, 0, 0)
-            hl.setSpacing(6)
-            if r == 0:
-                lab = QLabel(title)
-                lab.setObjectName("BarTitle")
-                hl.addWidget(lab)
-            else:
-                spacer = QLabel("")
-                spacer.setFixedWidth(60)
-                hl.addWidget(spacer)
-            for opt in chunk:
-                b = QToolButton()
-                b.setText(opt)
-                b.setCheckable(True)
-                b.setProperty("segmented", True)
-                b.clicked.connect(lambda checked, t=opt: on_select(t))
-                group.addButton(b)
-                btns[opt] = b
-                hl.addWidget(b)
-            hl.addStretch(1)
-            row_w = QWidget()
-            row_w.setLayout(hl)
-            outer.addWidget(row_w)
+        def _add_option_button(opt):
+            b = QToolButton()
+            b.setText(opt)
+            b.setCheckable(True)
+            b.setProperty("segmented", True)
+            b.clicked.connect(lambda checked, t=opt: on_select(t))
+            group.addButton(b)
+            btns[opt] = b
+            # insert before the trailing stretch (+ optional add button)
+            insert_at = hl.count() - 1 - (1 if on_add is not None else 0)
+            hl.insertWidget(max(1, insert_at), b)
+            return b
 
-        container.setLayout(outer)
-        return container, btns
+        for opt in options:
+            b = QToolButton()
+            b.setText(opt)
+            b.setCheckable(True)
+            b.setProperty("segmented", True)
+            b.clicked.connect(lambda checked, t=opt: on_select(t))
+            group.addButton(b)
+            btns[opt] = b
+            hl.addWidget(b)
+
+        hl.addStretch(1)
+
+        if on_add is not None:
+            add_btn = QToolButton()
+            add_btn.setText("＋")
+            add_btn.setProperty("segmented", True)
+            add_btn.setToolTip("Add a new option")
+            add_btn.clicked.connect(lambda: on_add())
+            hl.addWidget(add_btn)
+
+        container.setLayout(hl)
+        return container, btns, _add_option_button
 
     def _build_ui(self):
         central = QWidget()
@@ -1144,24 +1583,42 @@ class MainWindow(QMainWindow):
         self.video_label = VideoLabel()
         align_flag = Qt.AlignmentFlag.AlignCenter if _QT6 else Qt.AlignCenter
         self.video_label.setAlignment(align_flag)
-        self.video_label.setMinimumSize(QSize(740, 420))
+        self.video_label.setMinimumSize(QSize(640, 400))
+        try:
+            _exp = QSizePolicy.Policy.Expanding
+        except AttributeError:
+            _exp = QSizePolicy.Expanding
+        self.video_label.setSizePolicy(_exp, _exp)
 
-        # Behavior + Habitat bars (below video)
-        self.behavior_bar, self._behavior_btns = self._make_segment_bar(
-            "Behavior:", BEHAVIOR_OPTIONS, self._on_behavior_selected, rows=2
-        )
-        self.habitat_bar, self._habitat_btns = self._make_segment_bar(
+        # Scene-label bars (below video): two behavior axes + habitat + visibility
+        self.movement_bar, self._movement_btns, self._movement_append = \
+            self._make_segment_bar(
+                "Movement:", MOVEMENT_OPTIONS, self._on_movement_selected,
+                on_add=lambda: self._add_behavior_dialog("movement"))
+        self.social_bar, self._social_btns, self._social_append = \
+            self._make_segment_bar(
+                "Social:", SOCIAL_OPTIONS, self._on_social_selected,
+                on_add=lambda: self._add_behavior_dialog("social"))
+        self.habitat_bar, self._habitat_btns, _ = self._make_segment_bar(
             "Habitat:", HABITAT_OPTIONS, self._on_habitat_selected
         )
+        self.visibility_bar, self._visibility_btns, _ = self._make_segment_bar(
+            "Visibility:", VISIBILITY_OPTIONS, self._on_visibility_selected
+        )
         # initial highlight
-        self._behavior_btns[self._current_behavior].setChecked(True)
+        self._movement_btns[self._current_movement].setChecked(True)
+        self._social_btns[self._current_social].setChecked(True)
         self._habitat_btns[self._current_habitat].setChecked(True)
+        self._visibility_btns[self._current_visibility].setChecked(True)
 
         video_col = QVBoxLayout()
-        video_col.setSpacing(10)
+        video_col.setSpacing(2)
+        video_col.setContentsMargins(0, 0, 0, 0)
         video_col.addWidget(self.video_label, stretch=1)
-        video_col.addWidget(self.behavior_bar)
+        video_col.addWidget(self.movement_bar)
+        video_col.addWidget(self.social_bar)
         video_col.addWidget(self.habitat_bar)
+        video_col.addWidget(self.visibility_bar)
 
         video_wrap = QWidget()
         video_wrap.setLayout(video_col)
@@ -1204,20 +1661,21 @@ class MainWindow(QMainWindow):
         load_json_btn.setObjectName("Secondary")
         load_json_btn.clicked.connect(self._load_json)
 
-        # Category combo
+        # Category combo (derived from the loaded species config)
+        first_cat = SPECIES_CATEGORY_ORDER[0] if SPECIES_CATEGORY_ORDER else "Shark"
         self.category_combo = QComboBox()
-        self.category_combo.addItems(["Shark", "Ray", "Teleost fish", "Sea turtle", "Other"])
+        self.category_combo.addItems(SPECIES_CATEGORY_ORDER)
 
         category_row = QHBoxLayout()
         category_row.addWidget(QLabel("Category:"))
         category_row.addWidget(self.category_combo, stretch=1)
 
-        # Species combo (editable with autocomplete)
+        # Species combo (editable with autocomplete) + "add species" button
         self.species_combo = QComboBox()
         self.species_combo.setEditable(True)
         self.species_combo.addItem("")
-        self.species_combo.addItems(SPECIES_CATEGORIES.get("Shark", []))
-        completer = QCompleter(SPECIES_CATEGORIES.get("Shark", ALL_SPECIES))
+        self.species_combo.addItems(SPECIES_CATEGORIES.get(first_cat, []))
+        completer = QCompleter(SPECIES_CATEGORIES.get(first_cat, ALL_SPECIES))
         try:
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
             completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
@@ -1227,9 +1685,16 @@ class MainWindow(QMainWindow):
         self.species_combo.setCompleter(completer)
         self.category_combo.currentTextChanged.connect(self._on_category_changed)
 
+        self.add_species_btn = QToolButton()
+        self.add_species_btn.setText("＋")
+        self.add_species_btn.setProperty("segmented", True)
+        self.add_species_btn.setToolTip("Add a new species to the current category")
+        self.add_species_btn.clicked.connect(self._add_species_dialog)
+
         species_row = QHBoxLayout()
         species_row.addWidget(QLabel("Species:"))
         species_row.addWidget(self.species_combo, stretch=1)
+        species_row.addWidget(self.add_species_btn)
 
         # Count spinbox
         self.count_spin = QSpinBox()
@@ -1237,17 +1702,76 @@ class MainWindow(QMainWindow):
         self.count_spin.setMaximum(9999)
         self.count_spin.setValue(1)
 
+        # Confidence + Sex combos
+        self.confidence_combo = QComboBox()
+        self.confidence_combo.addItems(CONFIDENCE_OPTIONS)
+        self.sex_combo = QComboBox()
+        self.sex_combo.addItems(SEX_OPTIONS)
+
         count_row = QHBoxLayout()
         count_row.addWidget(QLabel("Count:"))
         count_row.addWidget(self.count_spin, stretch=1)
+        count_row.addWidget(QLabel("Conf:"))
+        count_row.addWidget(self.confidence_combo, stretch=1)
+        count_row.addWidget(QLabel("Sex:"))
+        count_row.addWidget(self.sex_combo, stretch=1)
 
         # Draw bbox toggle button
         self.bbox_btn = QPushButton("Draw Bbox")
         self.bbox_btn.setCheckable(True)
         self.bbox_btn.toggled.connect(self._bbox_mode_toggled)
 
-        # Wire bbox signal
+        # Wire bbox signals (two-click draw, corner edit, ctrl-wheel zoom)
         self.video_label.bboxDrawn.connect(self._on_bbox)
+        self.video_label.bboxEdited.connect(self._on_bbox_edited)
+        self.video_label.zoomRequested.connect(self._on_wheel_zoom)
+
+        # ---- Highlight clips ----
+        self.clip_range_lbl = QLabel("In —  ·  Out —")
+        self.clip_range_lbl.setObjectName("Subtle")
+        mark_in_btn = QPushButton("Mark In [")
+        mark_in_btn.setObjectName("Secondary")
+        mark_in_btn.clicked.connect(self._mark_in)
+        mark_out_btn = QPushButton("Mark Out ]")
+        mark_out_btn.setObjectName("Secondary")
+        mark_out_btn.clicked.connect(self._mark_out)
+        clip_mark_row = QHBoxLayout()
+        clip_mark_row.addWidget(mark_in_btn)
+        clip_mark_row.addWidget(mark_out_btn)
+
+        self.clips_list = QListWidget()
+        self.clips_list.setMaximumHeight(100)
+        self.clips_list.itemDoubleClicked.connect(self._on_clip_activated)
+        save_clip_btn = QPushButton("Save Clip")
+        save_clip_btn.setObjectName("Secondary")
+        save_clip_btn.clicked.connect(self._save_clip)
+        export_clip_btn = QPushButton("Export Clip")
+        export_clip_btn.clicked.connect(self._export_clip)
+        del_clip_btn = QPushButton("Delete Clip")
+        del_clip_btn.setObjectName("Secondary")
+        del_clip_btn.clicked.connect(self._delete_clip)
+        clip_btn_row = QHBoxLayout()
+        clip_btn_row.addWidget(save_clip_btn)
+        clip_btn_row.addWidget(del_clip_btn)
+
+        # ---- Timestamped notes ----
+        self.notes_list = QListWidget()
+        self.notes_list.setMaximumHeight(120)
+        self.notes_list.itemDoubleClicked.connect(self._on_note_activated)
+        self.note_edit = QLineEdit()
+        self.note_edit.setPlaceholderText("Note at current frame…")
+        self.note_edit.returnPressed.connect(self._add_note)
+        add_note_btn = QPushButton("Add Note")
+        add_note_btn.setObjectName("Secondary")
+        add_note_btn.clicked.connect(self._add_note)
+        del_note_btn = QPushButton("Delete Note")
+        del_note_btn.setObjectName("Secondary")
+        del_note_btn.clicked.connect(self._delete_note)
+        note_input_row = QHBoxLayout()
+        note_input_row.addWidget(self.note_edit, stretch=1)
+        note_input_row.addWidget(add_note_btn)
+        note_btn_row = QHBoxLayout()
+        note_btn_row.addWidget(del_note_btn)
 
         # Pack into a "card"
         card_layout = QVBoxLayout()
@@ -1259,6 +1783,16 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(QLabel("Annotated Features:"))
         card_layout.addWidget(self.feat_list, stretch=1)
         card_layout.addLayout(fa)
+        card_layout.addWidget(QLabel("Notes (double-click to jump):"))
+        card_layout.addWidget(self.notes_list)
+        card_layout.addLayout(note_input_row)
+        card_layout.addLayout(note_btn_row)
+        card_layout.addWidget(QLabel("Highlight clips (I / O to mark):"))
+        card_layout.addWidget(self.clip_range_lbl)
+        card_layout.addLayout(clip_mark_row)
+        card_layout.addWidget(self.clips_list)
+        card_layout.addLayout(clip_btn_row)
+        card_layout.addWidget(export_clip_btn)
         card_layout.addWidget(load_json_btn)
         card_layout.addWidget(exp_btn)
         card_layout.addWidget(plots_btn)
@@ -1272,19 +1806,24 @@ class MainWindow(QMainWindow):
         card_v.setSpacing(10)
         title = QLabel("Controls")
         title.setObjectName("Title")
-        subtitle = QLabel("Label behavior & habitat. Draw bboxes to annotate features on individual frames.")
+        subtitle = QLabel("Label movement, social, habitat & visibility. "
+                          "Draw bboxes to annotate animals; add notes at any frame.")
         subtitle.setObjectName("Subtle")
+        subtitle.setWordWrap(True)
         card_v.addWidget(title)
         card_v.addWidget(subtitle)
         card_v.addLayout(card_layout)
         card.setLayout(card_v)
 
-        rw = QWidget()
-        rw_l = QVBoxLayout()
-        rw_l.setContentsMargins(0, 0, 0, 0)
-        rw_l.addWidget(card)
-        rw.setLayout(rw_l)
-        rw.setMaximumWidth(320)
+        rw = QScrollArea()
+        rw.setWidget(card)
+        rw.setWidgetResizable(True)
+        rw.setFrameShape(QFrame.Shape.NoFrame if _QT6 else QFrame.NoFrame)
+        hbar_off = (Qt.ScrollBarPolicy.ScrollBarAlwaysOff if _QT6
+                    else Qt.ScrollBarAlwaysOff)
+        rw.setHorizontalScrollBarPolicy(hbar_off)
+        rw.setMaximumWidth(372)
+        rw.setMinimumWidth(340)
 
         # ---- playback controls ----
         self.play_btn = QPushButton("Play")
@@ -1318,6 +1857,26 @@ class MainWindow(QMainWindow):
         )
         self.label_mode_btn.clicked.connect(self._toggle_label_mode)
 
+        # Zoom controls
+        zoom_out_btn = QPushButton("－")
+        zoom_out_btn.setObjectName("Secondary")
+        zoom_out_btn.setToolTip("Zoom out (Ctrl/⌘ + wheel)")
+        zoom_out_btn.clicked.connect(self._zoom_out)
+        zoom_in_btn = QPushButton("＋")
+        zoom_in_btn.setObjectName("Secondary")
+        zoom_in_btn.setToolTip("Zoom in (Ctrl/⌘ + wheel)")
+        zoom_in_btn.clicked.connect(self._zoom_in)
+        zoom_reset_btn = QPushButton("Fit")
+        zoom_reset_btn.setObjectName("Secondary")
+        zoom_reset_btn.clicked.connect(self._zoom_reset)
+        self.zoom_lbl = QLabel("1.0×")
+        self.zoom_lbl.setObjectName("Subtle")
+
+        # Playlist switcher (multiple videos / folder loading)
+        self.video_combo = QComboBox()
+        self.video_combo.setMinimumWidth(140)
+        self.video_combo.currentIndexChanged.connect(self._on_playlist_changed)
+
         ctrls = QHBoxLayout()
         ctrls.setSpacing(8)
         ctrls.addWidget(self.back_btn)
@@ -1325,6 +1884,11 @@ class MainWindow(QMainWindow):
         ctrls.addWidget(self.fwd_btn)
         ctrls.addWidget(self.frame_lbl)
         ctrls.addStretch(1)
+        ctrls.addWidget(self.video_combo)
+        ctrls.addWidget(zoom_out_btn)
+        ctrls.addWidget(self.zoom_lbl)
+        ctrls.addWidget(zoom_in_btn)
+        ctrls.addWidget(zoom_reset_btn)
         ctrls.addWidget(self.label_mode_btn)
         ctrls.addWidget(QLabel("Speed:"))
         ctrls.addWidget(self.speed_combo)
@@ -1333,35 +1897,94 @@ class MainWindow(QMainWindow):
         self.timeline = AnnotationTimeline(self.store, self.fps, self.total_frames)
         self.timeline.frameSelected.connect(self._on_slider_seek)
 
-        # ---- keyboard shortcuts for frame stepping ----
-        QShortcut(
-            QKeySequence(Qt.Key.Key_Left if _QT6 else Qt.Key_Left), self
-        ).activated.connect(lambda: self.seek_to(self.current_frame_idx - 1))
-        QShortcut(
-            QKeySequence(Qt.Key.Key_Right if _QT6 else Qt.Key_Right), self
-        ).activated.connect(lambda: self.seek_to(self.current_frame_idx + 1))
+        # ---- menu bar ----
+        self._build_menu()
+
+        # ---- keyboard shortcuts ----
+        # Window-wide (modifier or arrow keys — safe around text fields)
+        def _sc(seq, fn):
+            QShortcut(QKeySequence(seq), self).activated.connect(fn)
+
+        _sc(Qt.Key.Key_Left if _QT6 else Qt.Key_Left,
+            lambda: self.seek_to(self.current_frame_idx - 1))
+        _sc(Qt.Key.Key_Right if _QT6 else Qt.Key_Right,
+            lambda: self.seek_to(self.current_frame_idx + 1))
+        _sc("Ctrl+Z", self._undo)      # Ctrl+Z
+        _sc("Meta+Z", self._undo)      # ⌘Z on macOS
+        _sc("Ctrl++", self._zoom_in)
+        _sc("Ctrl+=", self._zoom_in)
+        _sc("Ctrl+-", self._zoom_out)
+        _sc("Ctrl+I", self._mark_in)
+        _sc("Ctrl+O", self._mark_out)
+        _sc("F1", self._show_help)
+        # Delete only while the feature list is focused (so it can't eat text input)
+        wsc = (Qt.ShortcutContext.WidgetShortcut if _QT6 else Qt.WidgetShortcut)
+        for key in (Qt.Key.Key_Delete if _QT6 else Qt.Key_Delete,
+                    Qt.Key.Key_Backspace if _QT6 else Qt.Key_Backspace):
+            s = QShortcut(QKeySequence(key), self.feat_list)
+            s.setContext(wsc)
+            s.activated.connect(self._delete_feature)
 
         # ---- assemble ----
         top = QHBoxLayout()
-        top.setSpacing(14)
-        top.addWidget(video_wrap, stretch=3)
-        top.addWidget(rw, stretch=1)
+        top.setSpacing(8)
+        top.addWidget(video_wrap, stretch=1)
+        top.addWidget(rw, stretch=0)
 
         lay = QVBoxLayout()
-        lay.setContentsMargins(14, 14, 14, 14)
-        lay.setSpacing(12)
-        lay.addLayout(top)
+        lay.setContentsMargins(6, 6, 6, 4)
+        lay.setSpacing(5)
+        lay.addLayout(top, stretch=1)
         lay.addWidget(self.timeline)
         lay.addLayout(ctrls)
         central.setLayout(lay)
 
         self.statusBar().showMessage("Ready.")
         self._refresh_features()
+        self._refresh_notes()
+        self._refresh_clips()
+        self._update_clip_label()
+        self._update_zoom_label()
+
+    def _build_menu(self):
+        try:
+            from PyQt6.QtGui import QAction
+        except ImportError:
+            from PyQt5.QtWidgets import QAction
+        mb = self.menuBar()
+        file_menu = mb.addMenu("&File")
+        a1 = QAction("Open Video…", self)
+        a1.triggered.connect(self._open_video_dialog)
+        a2 = QAction("Open Frames Folder…", self)
+        a2.triggered.connect(self._open_frames_dialog)
+        a3 = QAction("Open Folder of Videos…", self)
+        a3.triggered.connect(self._open_folder_dialog)
+        for a in (a1, a2, a3):
+            file_menu.addAction(a)
+        file_menu.addSeparator()
+        a_save = QAction("Save JSON…", self)
+        a_save.triggered.connect(self._save_json)
+        file_menu.addAction(a_save)
+
+        help_menu = mb.addMenu("&Help")
+        a_help = QAction("Keyboard & usage help", self)
+        a_help.triggered.connect(self._show_help)
+        help_menu.addAction(a_help)
 
     # ------------------------------------------------------------ env/sub
     def _bbox_mode_toggled(self, on: bool):
         self.video_label.set_bbox_mode(on)
-        self.statusBar().showMessage("Draw a bbox on the video to annotate a feature." if on else "")
+        self._update_edit_rect(self.current_frame_idx)
+        if on:
+            self.bbox_btn.setText("Click 2 corners…")
+            self.bbox_btn.setStyleSheet(
+                "QPushButton { background:#4F46E5; color:#FFFFFF; border:none; }")
+            self.statusBar().showMessage(
+                "Click two corners on the video to draw a box (right-click cancels).")
+        else:
+            self.bbox_btn.setText("Draw Bbox")
+            self.bbox_btn.setStyleSheet("")
+            self.statusBar().showMessage("")
 
     def _on_bbox(self, p1, p2):
         m1 = self._map(p1.x(), p1.y())
@@ -1376,6 +1999,8 @@ class MainWindow(QMainWindow):
         species_category = self.category_combo.currentText() or "Other"
         species = self.species_combo.currentText().strip()
         count = self.count_spin.value()
+        confidence = self.confidence_combo.currentText().strip()
+        sex = self.sex_combo.currentText().strip()
         name = (self.name_edit.text() or "").strip()
         if not name:
             n = self._type_counters.get(species_category, 1)
@@ -1384,6 +2009,7 @@ class MainWindow(QMainWindow):
             self.name_edit.setText(name)
 
         fidx = self.current_frame_idx
+        self._push_undo()
         feat = TrackedFeature(
             name=name,
             init_frame=fidx,
@@ -1393,8 +2019,11 @@ class MainWindow(QMainWindow):
             count=count,
             species_category=species_category,
             species=species,
+            confidence=confidence,
+            sex=sex,
         )
         self.store.add_feature(feat, {}, {fidx: (x1, y1, x2, y2)})
+        self._selected_feature_idx = len(self.store.features) - 1
         self._refresh_features()
         self._display_frame(fidx)
         if hasattr(self, "timeline"):
@@ -1413,33 +2042,161 @@ class MainWindow(QMainWindow):
         self.bbox_btn.setChecked(False)
 
     def _map(self, lx: int, ly: int) -> Optional[Tuple[int, int]]:
-        """Label-widget coords → video-frame coords."""
-        pix = self.video_label.pixmap()
-        if pix is None:
+        """Label-widget coords → full-res video-frame coords (zoom-aware)."""
+        if not self._view:
             return None
-        lw, lh = self.video_label.width(), self.video_label.height()
-        pw, ph = pix.width(), pix.height()
-        ox, oy = (lw - pw) // 2, (lh - ph) // 2
+        vx, vy, vw, vh, pw, ph, ox, oy = self._view
         x, y = lx - ox, ly - oy
         if x < 0 or y < 0 or x >= pw or y >= ph:
             return None
-        fx = max(0, min(int(x * self.video_w / pw), self.video_w - 1))
-        fy = max(0, min(int(y * self.video_h / ph), self.video_h - 1))
+        fx = int(vx + x * vw / pw)
+        fy = int(vy + y * vh / ph)
+        fx = max(0, min(fx, self.video_w - 1))
+        fy = max(0, min(fy, self.video_h - 1))
         return (fx, fy)
 
-    def _on_behavior_selected(self, label: str):
-        self._current_behavior = label
-        self.store.set_behavior(self.current_frame_idx, label)
+    def _video_to_label(self, vx: float, vy: float) -> Tuple[float, float]:
+        """Full-res video coords → label-widget coords (zoom-aware)."""
+        if not self._view:
+            return (vx, vy)
+        rvx, rvy, rvw, rvh, pw, ph, ox, oy = self._view
+        lx = ox + (vx - rvx) * pw / max(1e-6, rvw)
+        ly = oy + (vy - rvy) * ph / max(1e-6, rvh)
+        return (lx, ly)
+
+    def _on_movement_selected(self, label: str):
+        self._push_undo()
+        self._current_movement = label
+        self.store.set_movement(self.current_frame_idx, label)
         if hasattr(self, "timeline"):
             self.timeline.update()
-        self.statusBar().showMessage(f"Behavior: {label}")
+        self.statusBar().showMessage(f"Movement: {label}")
+
+    def _on_social_selected(self, label: str):
+        self._push_undo()
+        self._current_social = label
+        self.store.set_social(self.current_frame_idx, label)
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+        self.statusBar().showMessage(f"Social: {label}")
 
     def _on_habitat_selected(self, label: str):
+        self._push_undo()
         self._current_habitat = label
         self.store.set_habitat(self.current_frame_idx, label)
         if hasattr(self, "timeline"):
             self.timeline.update()
         self.statusBar().showMessage(f"Habitat: {label}")
+
+    def _on_visibility_selected(self, label: str):
+        self._push_undo()
+        self._current_visibility = label
+        self.store.set_visibility(self.current_frame_idx, label)
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+        self.statusBar().showMessage(f"Visibility: {label}")
+
+    def _add_behavior_dialog(self, axis: str):
+        """Prompt for a new movement/social behavior, persist to CSV, add live."""
+        try:
+            from PyQt6.QtWidgets import QInputDialog
+        except ImportError:
+            from PyQt5.QtWidgets import QInputDialog
+        title = "Add movement behavior" if axis == "movement" else "Add social behavior"
+        text, ok = QInputDialog.getText(self, title, "New label:")
+        if not ok:
+            return
+        label = (text or "").strip()
+        if not label:
+            return
+        options = MOVEMENT_OPTIONS if axis == "movement" else SOCIAL_OPTIONS
+        btns = self._movement_btns if axis == "movement" else self._social_btns
+        if label in options:
+            btns[label].setChecked(True)
+            (self._on_movement_selected if axis == "movement"
+             else self._on_social_selected)(label)
+            return
+        options.append(label)
+        append_behavior_to_csv(axis, label)
+        append_fn = self._movement_append if axis == "movement" else self._social_append
+        append_fn(label)
+        # keep the timeline color maps in sync with the new option
+        if hasattr(self, "timeline"):
+            palette = FEATURE_COLORS
+            if axis == "movement":
+                i = len(MOVEMENT_OPTIONS) - 1
+                self.timeline._movement_colors[label] = QColor(*palette[i % len(palette)])
+            else:
+                i = len(SOCIAL_OPTIONS) - 1
+                self.timeline._social_colors[label] = QColor(*palette[(i + 3) % len(palette)])
+        btns[label].setChecked(True)
+        (self._on_movement_selected if axis == "movement"
+         else self._on_social_selected)(label)
+
+    def _add_species_dialog(self):
+        """Prompt for a new species under the current category; persist to CSV."""
+        try:
+            from PyQt6.QtWidgets import QInputDialog
+        except ImportError:
+            from PyQt5.QtWidgets import QInputDialog
+        category = self.category_combo.currentText() or "Other"
+        text, ok = QInputDialog.getText(
+            self, "Add species", f"New species name (category: {category}):")
+        if not ok:
+            return
+        name = (text or "").strip()
+        if not name:
+            return
+        SPECIES_CATEGORIES.setdefault(category, [])
+        if name not in SPECIES_CATEGORIES[category]:
+            SPECIES_CATEGORIES[category].append(name)
+            ALL_SPECIES.append(name)
+            append_species_to_csv(category, name)
+        # refresh the combo for the current category and select the new species
+        self._on_category_changed(category)
+        i = self.species_combo.findText(name)
+        if i >= 0:
+            self.species_combo.setCurrentIndex(i)
+        else:
+            self.species_combo.setEditText(name)
+        self.statusBar().showMessage(f"Added species '{name}' to {category}.")
+
+    # -------------------------------------------------------------- notes
+    def _refresh_notes(self):
+        self.notes_list.clear()
+        for note in self.store.notes:
+            t = self.timeline._format_time(note["frame"] / max(1e-6, self.fps))
+            it = QListWidgetItem(f"[{t}]  {note['text']}")
+            user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+            it.setData(user_role, note)
+            self.notes_list.addItem(it)
+
+    def _add_note(self):
+        text = (self.note_edit.text() or "").strip()
+        if not text:
+            return
+        self._push_undo()
+        self.store.add_note(self.current_frame_idx, text)
+        self.note_edit.clear()
+        self._refresh_notes()
+        self.statusBar().showMessage(f"Note added at frame {self.current_frame_idx}.")
+
+    def _delete_note(self):
+        it = self.notes_list.currentItem()
+        if it is None:
+            return
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        note = it.data(user_role)
+        if note is not None:
+            self._push_undo()
+            self.store.remove_note(note)
+            self._refresh_notes()
+
+    def _on_note_activated(self, item):
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        note = item.data(user_role)
+        if note is not None:
+            self.seek_to(int(note["frame"]))
 
     def _on_category_changed(self, category: str):
         self.species_combo.clear()
@@ -1460,22 +2217,32 @@ class MainWindow(QMainWindow):
         self.species_combo.setCompleter(completer)
 
     def _ensure_scene_labels(self, idx: int):
-        stored_beh = self.store.behavior_per_frame[idx]
+        stored_mov = self.store.movement_per_frame[idx]
+        stored_soc = self.store.social_per_frame[idx]
         stored_hab = self.store.habitat_per_frame[idx]
+        stored_vis = self.store.visibility_per_frame[idx]
 
         if not self.playing:
             # Seek/drag: update _current_* from stored values so the UI shows
             # what was annotated here, and future playback continues from it.
-            if stored_beh is not None:
-                self._current_behavior = stored_beh
+            if stored_mov is not None:
+                self._current_movement = stored_mov
+            if stored_soc is not None:
+                self._current_social = stored_soc
             if stored_hab is not None:
                 self._current_habitat = stored_hab
+            if stored_vis is not None:
+                self._current_visibility = stored_vis
         # During playback: _current_* stays fixed; _tick writes it to each frame.
 
-        if self._current_behavior in self._behavior_btns:
-            self._behavior_btns[self._current_behavior].setChecked(True)
+        if self._current_movement in self._movement_btns:
+            self._movement_btns[self._current_movement].setChecked(True)
+        if self._current_social in self._social_btns:
+            self._social_btns[self._current_social].setChecked(True)
         if self._current_habitat in self._habitat_btns:
             self._habitat_btns[self._current_habitat].setChecked(True)
+        if self._current_visibility in self._visibility_btns:
+            self._visibility_btns[self._current_visibility].setChecked(True)
 
     # ------------------------------------------------------- feature list
     def _refresh_features(self):
@@ -1485,7 +2252,12 @@ class MainWindow(QMainWindow):
             label = feat.species_category
             if feat.species:
                 label = f"{feat.species_category}: {feat.species}"
-            display = f"{label}  ×{feat.count}  [f{feat.init_frame}]  {feat.name}"
+            extra = ""
+            if feat.sex:
+                extra += {"Male": " ♂", "Female": " ♀", "Unknown": " ?"}.get(feat.sex, "")
+            if feat.confidence:
+                extra += f"  conf:{feat.confidence}"
+            display = f"{label}{extra}  ×{feat.count}  [f{feat.init_frame}]  {feat.name}"
             it = QListWidgetItem(display)
             user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
             it.setData(user_role, i)
@@ -1494,28 +2266,44 @@ class MainWindow(QMainWindow):
 
     def _delete_feature(self):
         it = self.feat_list.currentItem()
-        if it is None:
+        idx = None
+        if it is not None:
+            user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+            idx = it.data(user_role)
+        if idx is None:
+            idx = self._selected_feature_idx  # Delete key with no list focus
+        if idx is None or not (0 <= int(idx) < len(self.store.features)):
             return
-        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
-        idx = it.data(user_role)
-        if idx is not None:
-            self.store.remove_feature(int(idx))
-            self._refresh_features()
-            self._display_frame(self.current_frame_idx)
-            if hasattr(self, "timeline"):
-                self.timeline.update()
+        self._push_undo()
+        self.store.remove_feature(int(idx))
+        self._selected_feature_idx = None
+        self.video_label.set_edit_rect(None)
+        self._refresh_features()
+        self._display_frame(self.current_frame_idx)
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+        self.statusBar().showMessage("Deleted feature.")
 
     def _on_feature_selected(self, current, previous):
         """Populate edit fields when a feature is selected in the list."""
         if current is None:
+            self._selected_feature_idx = None
+            self.video_label.set_edit_rect(None)
             return
         user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
         idx = current.data(user_role)
         if idx is None or not (0 <= idx < len(self.store.features)):
             return
+        self._selected_feature_idx = int(idx)
+        self._update_edit_rect(self.current_frame_idx)
         feat = self.store.features[idx]
         self.name_edit.setText(feat.name)
         self.count_spin.setValue(feat.count)
+        # Set confidence + sex combos
+        ci = self.confidence_combo.findText(feat.confidence)
+        self.confidence_combo.setCurrentIndex(ci if ci >= 0 else 0)
+        si = self.sex_combo.findText(feat.sex)
+        self.sex_combo.setCurrentIndex(si if si >= 0 else 0)
         # Set category combo
         cat_idx = self.category_combo.findText(feat.species_category)
         if cat_idx >= 0:
@@ -1536,6 +2324,7 @@ class MainWindow(QMainWindow):
         idx = it.data(user_role)
         if idx is None or not (0 <= int(idx) < len(self.store.features)):
             return
+        self._push_undo()
         feat = self.store.features[int(idx)]
         name = (self.name_edit.text() or "").strip()
         if name:
@@ -1543,6 +2332,8 @@ class MainWindow(QMainWindow):
         feat.species_category = self.category_combo.currentText()
         feat.species = self.species_combo.currentText().strip()
         feat.count = self.count_spin.value()
+        feat.confidence = self.confidence_combo.currentText().strip()
+        feat.sex = self.sex_combo.currentText().strip()
         self._refresh_features()
         self._display_frame(self.current_frame_idx)
         if hasattr(self, "timeline"):
@@ -1555,40 +2346,11 @@ class MainWindow(QMainWindow):
         if not p:
             return
         try:
-            loaded = FeatureStore.load_json(p)
-            # Merge scene labels and features into current store
-            for fi in range(min(len(loaded.behavior_per_frame), self.store.total_frames)):
-                if loaded.behavior_per_frame[fi] is not None:
-                    self.store.behavior_per_frame[fi] = loaded.behavior_per_frame[fi]
-                if loaded.habitat_per_frame[fi] is not None:
-                    self.store.habitat_per_frame[fi] = loaded.habitat_per_frame[fi]
-            for feat, masks, bboxes in zip(loaded.features, loaded.feature_masks, loaded.feature_bboxes):
-                self.store.features.append(feat)
-                self.store.feature_masks.append(masks)
-                self.store.feature_bboxes.append(bboxes)
-            self._refresh_features()
-            if hasattr(self, "timeline"):
-                self.timeline.update()
-            self._display_frame(self.current_frame_idx)
+            self._push_undo()
+            self._apply_loaded_store(FeatureStore.load_json(p))
             self.statusBar().showMessage(f"Loaded {p}")
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
-
-    # ----------------------------------------------------------- coord map
-    def _map(self, lx: int, ly: int) -> Optional[Tuple[int, int]]:
-        """Label-widget coords → video-frame coords."""
-        pix = self.video_label.pixmap()
-        if pix is None:
-            return None
-        lw, lh = self.video_label.width(), self.video_label.height()
-        pw, ph = pix.width(), pix.height()
-        ox, oy = (lw - pw) // 2, (lh - ph) // 2
-        x, y = lx - ox, ly - oy
-        if x < 0 or y < 0 or x >= pw or y >= ph:
-            return None
-        fx = max(0, min(int(x * self.video_w / pw), self.video_w - 1))
-        fy = max(0, min(int(y * self.video_h / ph), self.video_h - 1))
-        return (fx, fy)
 
     # ------------------------------------------------------------- playback
     def toggle_play(self):
@@ -1613,8 +2375,10 @@ class MainWindow(QMainWindow):
     def _on_slider_seek(self, idx: int):
         if self._labeling and idx > self.current_frame_idx:
             for f in range(self.current_frame_idx, idx + 1):
-                self.store.set_behavior(f, self._current_behavior)
+                self.store.set_movement(f, self._current_movement)
+                self.store.set_social(f, self._current_social)
                 self.store.set_habitat(f, self._current_habitat)
+                self.store.set_visibility(f, self._current_visibility)
             if hasattr(self, "timeline"):
                 self.timeline.update()
         self.seek_to(idx)
@@ -1626,8 +2390,11 @@ class MainWindow(QMainWindow):
             self.timer.stop()
             return
         if self._labeling:
-            self.store.set_behavior(self.current_frame_idx, self._current_behavior)
-            self.store.set_habitat(self.current_frame_idx, self._current_habitat)
+            fi = self.current_frame_idx
+            self.store.set_movement(fi, self._current_movement)
+            self.store.set_social(fi, self._current_social)
+            self.store.set_habitat(fi, self._current_habitat)
+            self.store.set_visibility(fi, self._current_visibility)
         self.seek_to(self.current_frame_idx + 1)
 
     def seek_to(self, idx: int):
@@ -1640,7 +2407,9 @@ class MainWindow(QMainWindow):
             self.timeline.set_current_frame(idx)
 
         self.frame_lbl.setText(
-            f"Frame {idx}/{self.total_frames - 1} • {self._current_behavior} • {self._current_habitat}"
+            f"Frame {idx}/{self.total_frames - 1} • {self._current_movement}"
+            f" + {self._current_social} • {self._current_habitat}"
+            f" • vis: {self._current_visibility}"
         )
 
     # -------------------------------------------------------------- display
@@ -1653,6 +2422,19 @@ class MainWindow(QMainWindow):
         ok, frame = self.cap.read()
         return frame if ok else None
 
+    def _view_rect(self):
+        """Compute the region of the full-res frame to show given zoom/center."""
+        z = max(1.0, float(self._zoom))
+        vw = int(round(self.video_w / z))
+        vh = int(round(self.video_h / z))
+        vw = max(1, min(vw, self.video_w))
+        vh = max(1, min(vh, self.video_h))
+        vx = int(round(self._zoom_cx - vw / 2))
+        vy = int(round(self._zoom_cy - vh / 2))
+        vx = max(0, min(vx, self.video_w - vw))
+        vy = max(0, min(vy, self.video_h - vh))
+        return vx, vy, vw, vh
+
     def _display_frame(self, idx):
         frame = self._read_frame(idx)
         if frame is None:
@@ -1662,23 +2444,17 @@ class MainWindow(QMainWindow):
         # overlay committed features (bboxes only — no SAM2 masks)
         for _, feat, mask, bbox in self.store.features_at(idx):
             bgr = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)][::-1]
-            feat_label = feat.species_category
-            if feat.species:
-                feat_label = f"{feat.species_category}: {feat.species}"
-            if feat.count > 1:
-                feat_label = f"{feat_label} ×{feat.count}"
-            self._draw_mask(preview, mask, bgr, feat_label, bbox)
+            self._draw_mask(preview, mask, bgr, self._feature_label(feat), bbox)
 
         # scene text (anti-aliased)
-        beh = self.store.behavior_per_frame[idx] or self._current_behavior
-        hab = self.store.habitat_per_frame[idx] or self._current_habitat
-        text = f"{beh} • {hab}"
-        cv2.putText(preview, text, (14, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(preview, text, (14, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+        self._draw_scene_overlay(preview, idx)
 
-        rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+        # crop to the zoom viewport
+        vx, vy, vw, vh = self._view_rect()
+        view = preview[vy:vy + vh, vx:vx + vw]
+
+        rgb = cv2.cvtColor(view, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
         h, w = rgb.shape[:2]
         qimg = QImage(rgb.data, w, h, 3 * w,
                       QImage.Format.Format_RGB888 if _QT6 else QImage.Format_RGB888)
@@ -1686,6 +2462,45 @@ class MainWindow(QMainWindow):
         transform_mode = Qt.TransformationMode.SmoothTransformation if _QT6 else Qt.SmoothTransformation
         pix = QPixmap.fromImage(qimg).scaled(self.video_label.size(), aspect_mode, transform_mode)
         self.video_label.set_frame_pixmap(pix)
+
+        # record the view transform for coord mapping
+        lw, lh = self.video_label.width(), self.video_label.height()
+        pw, ph = pix.width(), pix.height()
+        ox, oy = (lw - pw) // 2, (lh - ph) // 2
+        self._view = (vx, vy, vw, vh, pw, ph, ox, oy)
+
+        # keep the selected box's edit handles in sync with the view
+        self._update_edit_rect(idx)
+
+    @staticmethod
+    def _feature_label(feat) -> str:
+        """Compose the on-frame label for a feature (species, sex, count, conf)."""
+        lbl = feat.species_category
+        if feat.species:
+            lbl = f"{feat.species_category}: {feat.species}"
+        sex_abbr = {"Male": "♂", "Female": "♀", "Unknown": "?"}.get(feat.sex, "")
+        if sex_abbr:
+            lbl = f"{lbl} {sex_abbr}"
+        if feat.count > 1:
+            lbl = f"{lbl} x{feat.count}"
+        if feat.confidence:
+            lbl = f"{lbl} ({feat.confidence[:1].lower()})"
+        return lbl
+
+    def _draw_scene_overlay(self, img, idx):
+        """Burn the current scene labels (movement/social/habitat/visibility) in."""
+        mov = self.store.movement_per_frame[idx] or self._current_movement
+        soc = self.store.social_per_frame[idx] or self._current_social
+        hab = self.store.habitat_per_frame[idx] or self._current_habitat
+        vis = self.store.visibility_per_frame[idx] or self._current_visibility
+        line1 = f"{mov}  |  {soc}"
+        line2 = f"{hab}  |  vis: {vis}"
+        for i, text in enumerate((line1, line2)):
+            y = 30 + i * 28
+            cv2.putText(img, text, (14, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(img, text, (14, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
     @staticmethod
     def _draw_mask(img, mask, bgr_color, label, bbox):
@@ -1709,6 +2524,457 @@ class MainWindow(QMainWindow):
         self._display_frame(self.current_frame_idx)
         if hasattr(self, "timeline"):
             self.timeline.update()
+
+    # ----------------------------------------------------------- zoom
+    def _selected_bbox_on_frame(self, idx):
+        """Return (feat_idx, bbox) if the selected feature has a box on `idx`."""
+        fi = self._selected_feature_idx
+        if fi is None or not (0 <= fi < len(self.store.features)):
+            return None
+        bbox = self.store.feature_bboxes[fi].get(idx)
+        if bbox is None:
+            return None
+        return fi, bbox
+
+    def _update_edit_rect(self, idx):
+        """Push the selected feature's box to the VideoLabel as editable handles."""
+        if not hasattr(self, "video_label"):
+            return
+        sel = self._selected_bbox_on_frame(idx)
+        if sel is None or self.video_label._bbox_mode:
+            self.video_label.set_edit_rect(None)
+            return
+        _, (x1, y1, x2, y2) = sel
+        lx1, ly1 = self._video_to_label(x1, y1)
+        lx2, ly2 = self._video_to_label(x2, y2)
+        self.video_label.set_edit_rect([lx1, ly1, lx2, ly2])
+
+    def _on_bbox_edited(self, lx1, ly1, lx2, ly2):
+        """A corner handle was dragged — map back to video coords and store it."""
+        sel = self._selected_bbox_on_frame(self.current_frame_idx)
+        if sel is None:
+            return
+        fi, _ = sel
+        m1 = self._map(lx1, ly1)
+        m2 = self._map(lx2, ly2)
+        if m1 is None or m2 is None:
+            self._display_frame(self.current_frame_idx)  # snap back
+            return
+        x1, y1 = min(m1[0], m2[0]), min(m1[1], m2[1])
+        x2, y2 = max(m1[0], m2[0]), max(m1[1], m2[1])
+        if abs(x2 - x1) < 3 or abs(y2 - y1) < 3:
+            self._display_frame(self.current_frame_idx)
+            return
+        self._push_undo()
+        self.store.feature_bboxes[fi][self.current_frame_idx] = (x1, y1, x2, y2)
+        feat = self.store.features[fi]
+        if self.current_frame_idx == feat.init_frame:
+            feat.init_coords = [x1, y1, x2, y2]
+        self._display_frame(self.current_frame_idx)
+        self.statusBar().showMessage(f"Resized box for '{feat.name}'.")
+
+    def _zoom_at(self, factor, anchor_label=None):
+        """Multiply zoom by `factor`, keeping the point under `anchor_label` fixed."""
+        old = self._zoom
+        new = max(1.0, min(8.0, old * factor))
+        if abs(new - old) < 1e-3:
+            return
+        # anchor: recentre so the cursor's video point stays put
+        if anchor_label is not None and self._view:
+            m = self._map(anchor_label.x(), anchor_label.y())
+            if m is not None:
+                ax, ay = m
+                self._zoom = new
+                # new view centred to keep (ax,ay) near the same spot
+                self._zoom_cx = ax
+                self._zoom_cy = ay
+            else:
+                self._zoom = new
+        else:
+            self._zoom = new
+        if new <= 1.0:
+            self._zoom_cx = self.video_w / 2.0
+            self._zoom_cy = self.video_h / 2.0
+        self._display_frame(self.current_frame_idx)
+        self._update_zoom_label()
+
+    def _on_wheel_zoom(self, delta, anchor):
+        self._zoom_at(1.15 if delta > 0 else 1 / 1.15, anchor)
+
+    def _zoom_in(self):
+        self._zoom_at(1.25, None)
+
+    def _zoom_out(self):
+        self._zoom_at(1 / 1.25, None)
+
+    def _zoom_reset(self):
+        self._zoom = 1.0
+        self._zoom_cx = self.video_w / 2.0
+        self._zoom_cy = self.video_h / 2.0
+        self._display_frame(self.current_frame_idx)
+        self._update_zoom_label()
+
+    def _update_zoom_label(self):
+        if hasattr(self, "zoom_lbl"):
+            self.zoom_lbl.setText(f"{self._zoom:.1f}×")
+
+    # ------------------------------------------------------------- undo
+    def _snapshot(self) -> dict:
+        s = self.store
+        return {
+            "movement": list(s.movement_per_frame),
+            "social": list(s.social_per_frame),
+            "habitat": list(s.habitat_per_frame),
+            "visibility": list(s.visibility_per_frame),
+            "features": copy.deepcopy(s.features),
+            "bboxes": copy.deepcopy(s.feature_bboxes),
+            "masks": [dict(m) for m in s.feature_masks],
+            "next_color": s._next_color,
+            "notes": copy.deepcopy(s.notes),
+            "clips": copy.deepcopy(s.clips),
+            "sel": self._selected_feature_idx,
+        }
+
+    def _push_undo(self):
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+
+    def _undo(self):
+        if not self._undo_stack:
+            self.statusBar().showMessage("Nothing to undo.")
+            return
+        snap = self._undo_stack.pop()
+        s = self.store
+        s.movement_per_frame = snap["movement"]
+        s.social_per_frame = snap["social"]
+        s.habitat_per_frame = snap["habitat"]
+        s.visibility_per_frame = snap["visibility"]
+        s.features = snap["features"]
+        s.feature_bboxes = snap["bboxes"]
+        s.feature_masks = snap["masks"]
+        s._next_color = snap["next_color"]
+        s.notes = snap["notes"]
+        s.clips = snap["clips"]
+        self._selected_feature_idx = snap["sel"]
+        self._refresh_features()
+        self._refresh_notes()
+        self._refresh_clips()
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+        self._display_frame(self.current_frame_idx)
+        self.statusBar().showMessage("Undo.")
+
+    # ------------------------------------------------------- clips
+    @staticmethod
+    def _std_buttons():
+        if _QT6:
+            return (QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No)
+        return (QMessageBox.Yes, QMessageBox.No)
+
+    def _mark_in(self):
+        self._clip_in = self.current_frame_idx
+        if self._clip_out is not None and self._clip_out < self._clip_in:
+            self._clip_out = None
+        self._update_clip_label()
+
+    def _mark_out(self):
+        self._clip_out = self.current_frame_idx
+        if self._clip_in is not None and self._clip_in > self._clip_out:
+            self._clip_in = None
+        self._update_clip_label()
+
+    def _update_clip_label(self):
+        def t(f):
+            return (self.timeline._format_time(f / max(1e-6, self.fps))
+                    if f is not None else "—")
+        if hasattr(self, "clip_range_lbl"):
+            self.clip_range_lbl.setText(
+                f"In {t(self._clip_in)}  ·  Out {t(self._clip_out)}")
+        if hasattr(self, "timeline"):
+            self.timeline.clip_in = self._clip_in
+            self.timeline.clip_out = self._clip_out
+            self.timeline.update()
+
+    def _save_clip(self):
+        if self._clip_in is None or self._clip_out is None:
+            QMessageBox.information(self, "Clip", "Set both In and Out marks first.")
+            return
+        a, b = sorted((self._clip_in, self._clip_out))
+        try:
+            from PyQt6.QtWidgets import QInputDialog
+        except ImportError:
+            from PyQt5.QtWidgets import QInputDialog
+        default = f"clip_{len(self.store.clips) + 1}"
+        name, ok = QInputDialog.getText(self, "Save clip", "Clip name:", text=default)
+        if not ok:
+            return
+        name = (name or default).strip()
+        self._push_undo()
+        self.store.clips.append({"name": name, "start": a, "end": b})
+        self._refresh_clips()
+        self.statusBar().showMessage(f"Saved clip '{name}' [{a}–{b}].")
+
+    def _refresh_clips(self):
+        if not hasattr(self, "clips_list"):
+            return
+        self.clips_list.clear()
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        for i, c in enumerate(self.store.clips):
+            t = self.timeline._format_time
+            dur = (c["end"] - c["start"] + 1) / max(1e-6, self.fps)
+            it = QListWidgetItem(
+                f"{c['name']}  [{t(c['start'] / self.fps)}–{t(c['end'] / self.fps)}]"
+                f"  {dur:.1f}s")
+            it.setData(user_role, i)
+            self.clips_list.addItem(it)
+
+    def _delete_clip(self):
+        it = self.clips_list.currentItem()
+        if it is None:
+            return
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        i = it.data(user_role)
+        if i is not None and 0 <= i < len(self.store.clips):
+            self._push_undo()
+            self.store.clips.pop(i)
+            self._refresh_clips()
+            if hasattr(self, "timeline"):
+                self.timeline.update()
+
+    def _on_clip_activated(self, item):
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        i = item.data(user_role)
+        if i is not None and 0 <= i < len(self.store.clips):
+            c = self.store.clips[i]
+            self._clip_in, self._clip_out = c["start"], c["end"]
+            self._update_clip_label()
+            self.seek_to(c["start"])
+
+    def _export_clip(self):
+        it = self.clips_list.currentItem() if hasattr(self, "clips_list") else None
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        if it is not None:
+            i = it.data(user_role)
+            c = self.store.clips[i]
+            a, b, nm = c["start"], c["end"], c["name"]
+        elif self._clip_in is not None and self._clip_out is not None:
+            a, b = sorted((self._clip_in, self._clip_out))
+            nm = "clip"
+        else:
+            QMessageBox.information(
+                self, "Export clip",
+                "Select a saved clip in the list, or set In/Out marks first.")
+            return
+        if self.playing:
+            self.toggle_play()
+        yes, no = self._std_buttons()
+        ret = QMessageBox.question(
+            self, "Annotation overlays",
+            "Burn annotation overlays (labels + boxes) into the exported clip?",
+            yes | no)
+        overlays = (ret == yes)
+        p, _ = QFileDialog.getSaveFileName(
+            self, "Export clip", f"{nm}.mp4", "MP4 (*.mp4)")
+        if not p:
+            return
+        try:
+            self._render_clip(p, a, b, overlays)
+            QMessageBox.information(self, "Done", f"Clip exported:\n{p}")
+        except Exception as e:
+            QMessageBox.critical(self, "Clip export error", str(e))
+
+    def _render_clip(self, out_path, start, end, overlays):
+        start = max(0, min(int(start), self.total_frames - 1))
+        end = max(0, min(int(end), self.total_frames - 1))
+        if end < start:
+            start, end = end, start
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        w = cv2.VideoWriter(out_path, fourcc, self.fps, (self.video_w, self.video_h))
+        for fidx in range(start, end + 1):
+            frame = self._read_frame(fidx)
+            if frame is None:
+                continue
+            if overlays:
+                for _, feat, mask, bbox in self.store.features_at(fidx):
+                    bgr = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)][::-1]
+                    self._draw_mask(frame, mask, bgr, self._feature_label(feat), bbox)
+                self._draw_scene_overlay(frame, fidx)
+            w.write(frame)
+        w.release()
+
+    # -------------------------------------------------------- autosave
+    def _autosave_path(self) -> str:
+        base = self.store.video_path or self.video_path
+        if base and os.path.isdir(base):
+            return os.path.join(base, ".ctag_autosave.json")
+        return (base or self.video_path) + ".ctag_autosave.json"
+
+    def _has_annotations(self) -> bool:
+        s = self.store
+        if s.features or s.notes or s.clips:
+            return True
+        for tl in (s.movement_per_frame, s.social_per_frame,
+                   s.habitat_per_frame, s.visibility_per_frame):
+            if any(v is not None for v in tl):
+                return True
+        return False
+
+    def _autosave(self):
+        if not self._has_annotations():
+            return
+        try:
+            self.store.save_json(self._autosave_path())
+            self.statusBar().showMessage("Autosaved.", 2000)
+        except Exception:
+            pass
+
+    def _apply_loaded_store(self, loaded: "FeatureStore"):
+        """Merge a loaded store's annotations into the current store."""
+        n = min(loaded.total_frames, self.store.total_frames)
+        for fi in range(n):
+            for src, dst in (
+                (loaded.movement_per_frame, self.store.movement_per_frame),
+                (loaded.social_per_frame, self.store.social_per_frame),
+                (loaded.habitat_per_frame, self.store.habitat_per_frame),
+                (loaded.visibility_per_frame, self.store.visibility_per_frame),
+            ):
+                if fi < len(src) and src[fi] is not None:
+                    dst[fi] = src[fi]
+        for feat, masks, bboxes in zip(loaded.features, loaded.feature_masks,
+                                       loaded.feature_bboxes):
+            self.store.features.append(feat)
+            self.store.feature_masks.append(masks)
+            self.store.feature_bboxes.append(bboxes)
+        for note in loaded.notes:
+            self.store.notes.append(note)
+        self.store.notes.sort(key=lambda nn: nn["frame"])
+        for clip in loaded.clips:
+            self.store.clips.append(clip)
+        self._refresh_features()
+        self._refresh_notes()
+        self._refresh_clips()
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+        self._display_frame(self.current_frame_idx)
+
+    def _maybe_resume_autosave(self):
+        p = self._autosave_path()
+        if not os.path.exists(p) or self._has_annotations():
+            return
+        yes, no = self._std_buttons()
+        ret = QMessageBox.question(
+            self, "Resume previous work",
+            f"Found autosaved annotations for this video:\n{p}\n\nLoad them?",
+            yes | no)
+        if ret == yes:
+            try:
+                self._apply_loaded_store(FeatureStore.load_json(p))
+                self.statusBar().showMessage("Resumed autosaved annotations.")
+            except Exception as e:
+                QMessageBox.warning(self, "Resume failed", str(e))
+
+    # ------------------------------------------------ multi-video / folders
+    def _open_video_dialog(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Open video", "", "Video (*.mp4 *.MP4 *.mov *.avi *.mkv)")
+        if p:
+            self._playlist = [p]
+            self._refresh_playlist()
+            self._switch_source(p, is_frame_dir=False)
+
+    def _open_frames_dialog(self):
+        d = QFileDialog.getExistingDirectory(self, "Open frames directory")
+        if d:
+            self._playlist = [d]
+            self._refresh_playlist()
+            self._switch_source(d, is_frame_dir=True)
+
+    def _open_folder_dialog(self):
+        d = QFileDialog.getExistingDirectory(self, "Open folder of videos")
+        if not d:
+            return
+        exts = (".mp4", ".mov", ".avi", ".mkv")
+        vids = [os.path.join(d, f) for f in sorted(os.listdir(d))
+                if f.lower().endswith(exts)]
+        if not vids:
+            QMessageBox.information(self, "Open folder",
+                                    "No video files found in that folder.")
+            return
+        self._playlist = vids
+        self._refresh_playlist()
+        self._switch_source(vids[0], is_frame_dir=False)
+
+    def _refresh_playlist(self):
+        if not hasattr(self, "video_combo"):
+            return
+        self.video_combo.blockSignals(True)
+        self.video_combo.clear()
+        for p in getattr(self, "_playlist", []):
+            self.video_combo.addItem(os.path.basename(p), p)
+        self.video_combo.blockSignals(False)
+
+    def _on_playlist_changed(self, i):
+        if i < 0 or i >= len(getattr(self, "_playlist", [])):
+            return
+        p = self._playlist[i]
+        self._switch_source(p, is_frame_dir=os.path.isdir(p))
+
+    def _switch_source(self, path, is_frame_dir):
+        # persist current work first
+        self._autosave()
+        if self.playing:
+            self.toggle_play()
+        try:
+            prep = prepare_source(path, is_frame_dir)
+        except Exception as e:
+            QMessageBox.critical(self, "Open failed", str(e))
+            return
+        # tear down old source
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        old_temp = self.temp_dir
+        # adopt new source
+        self.video_path = prep["frames_source"]
+        self.is_frame_dir = prep["is_frame_dir"]
+        self.temp_dir = prep["temp_dir"]
+        self.fps = prep["fps"] or 30.0
+        self.total_frames = prep["total_frames"]
+        self.video_w = prep["video_w"]
+        self.video_h = prep["video_h"]
+        if self.is_frame_dir:
+            self.frame_files = prep["frame_files"]
+            self.cap = None
+        else:
+            self.frame_files = None
+            self.cap = cv2.VideoCapture(self.video_path)
+        self.store = FeatureStore(prep["original"] or self.video_path, self.fps,
+                                  self.total_frames, self.video_w, self.video_h)
+        # reset transient state
+        self._selected_feature_idx = None
+        self._undo_stack.clear()
+        self._clip_in = self._clip_out = None
+        self._zoom = 1.0
+        self._zoom_cx, self._zoom_cy = self.video_w / 2.0, self.video_h / 2.0
+        # point the timeline at the new store
+        self.timeline.store = self.store
+        self.timeline.fps = self.fps
+        self.timeline.total_frames = max(1, self.total_frames)
+        self.timeline.current_frame = 0
+        self.timeline.clip_in = self.timeline.clip_out = None
+        self.setWindowTitle(f"CTAG Annotator — {os.path.basename(path)}")
+        self.current_frame_idx = 0
+        self._refresh_features()
+        self._refresh_notes()
+        self._refresh_clips()
+        self._update_clip_label()
+        self._update_zoom_label()
+        self.seek_to(0)
+        # clean up the previous temp frames dir (if any)
+        if old_temp and os.path.isdir(old_temp):
+            shutil.rmtree(old_temp, ignore_errors=True)
+        self._maybe_resume_autosave()
 
     # -------------------------------------------------------------- export
     def _save_plots(self, base_path: str) -> list:
@@ -1755,7 +3021,11 @@ class MainWindow(QMainWindow):
         # This means a habitat annotated at frame 20 applies to frames 20-N
         # until the next annotation, matching the "persist until changed" UX.
         hab_timeline = self._propagate(store.habitat_per_frame)
-        beh_timeline = self._propagate(store.behavior_per_frame)
+        mov_timeline = self._propagate(store.movement_per_frame)
+        soc_timeline = self._propagate(store.social_per_frame)
+        vis_timeline = self._propagate(store.visibility_per_frame)
+        # Movement is the primary "behavior" axis for the per-habitat plots.
+        beh_timeline = mov_timeline
 
         WHITE = "#FFFFFF"
         BG    = "#F8FAFC"
@@ -1766,6 +3036,11 @@ class MainWindow(QMainWindow):
             "Sandy bottom": "#F59E0B",
             "Gravel":       "#9CA3AF",
             "Mud":          "#78644A",
+        }
+        VIS_COLORS = {
+            "Good":     "#22C55E",
+            "Moderate": "#F59E0B",
+            "Poor":     "#EF4444",
         }
         BEH_COLORS = [
             "#4F46E5", "#06B6D4", "#10B981", "#F59E0B", "#EF4444",
@@ -1965,23 +3240,25 @@ class MainWindow(QMainWindow):
             plt.close(fig)
             saved.append(out)
 
-        # ── 2. Behavior composition — donut chart ─────────────────────
-        beh_counts = Counter(lab for lab in beh_timeline if lab)
-        if beh_counts:
-            ordered = [b for b in BEHAVIOR_OPTIONS if b in beh_counts]
-            ordered += [b for b in beh_counts if b not in ordered]
-            vals    = [beh_counts[b] for b in ordered]
-            colors  = []
+        # ── 2. Behavior composition donuts — movement + social axes ───
+        def _axis_donut(timeline, options, title, out_name):
+            counts = Counter(lab for lab in timeline if lab)
+            if not counts:
+                return
+            ordered = [b for b in options if b in counts]
+            ordered += [b for b in counts if b not in ordered]
+            vals = [counts[b] for b in ordered]
+            colors = []
             for b in ordered:
                 try:
-                    colors.append(BEH_COLORS[BEHAVIOR_OPTIONS.index(b) % len(BEH_COLORS)])
+                    colors.append(BEH_COLORS[options.index(b) % len(BEH_COLORS)])
                 except ValueError:
-                    colors.append(DEFAULT_CLR)
+                    colors.append(BEH_COLORS[len(colors) % len(BEH_COLORS)])
             short = [b.split(" - ", 1)[-1] if " - " in b else b for b in ordered]
-            pct   = 100 * sum(vals) / max(total, 1)
+            pct = 100 * sum(vals) / max(total, 1)
             fig, ax = plt.subplots(figsize=(9, 7))
             fig.patch.set_facecolor(WHITE)
-            _donut(ax, short, vals, colors, "Behavior Composition",
+            _donut(ax, short, vals, colors, title,
                    center_text=f"{pct:.0f}%\nannotated")
             handles = [Patch(facecolor=c, edgecolor=WHITE, label=lbl)
                        for c, lbl in zip(colors, short)]
@@ -1991,10 +3268,14 @@ class MainWindow(QMainWindow):
                             columnspacing=1.0, handlelength=1.2)
             leg.get_frame().set_linewidth(0.8)
             plt.tight_layout(pad=1.5)
-            out = f"{base_path}_2_behavior.png"
-            fig.savefig(out, dpi=200, bbox_inches="tight", facecolor=WHITE)
+            fig.savefig(out_name, dpi=200, bbox_inches="tight", facecolor=WHITE)
             plt.close(fig)
-            saved.append(out)
+            saved.append(out_name)
+
+        _axis_donut(mov_timeline, MOVEMENT_OPTIONS, "Movement Composition",
+                    f"{base_path}_2_movement.png")
+        _axis_donut(soc_timeline, SOCIAL_OPTIONS, "Social Composition",
+                    f"{base_path}_2b_social.png")
 
         # ── 3. Habitat composition — donut chart ──────────────────────
         hab_counts = Counter(lab for lab in hab_timeline if lab)
@@ -2020,6 +3301,31 @@ class MainWindow(QMainWindow):
             plt.close(fig)
             saved.append(out)
 
+        # ── 3b. Visibility composition — donut chart ──────────────────
+        vis_counts = Counter(lab for lab in vis_timeline if lab)
+        if vis_counts:
+            ordered = [v for v in VISIBILITY_OPTIONS if v in vis_counts]
+            ordered += [v for v in vis_counts if v not in ordered]
+            vals    = [vis_counts[v] for v in ordered]
+            colors  = [VIS_COLORS.get(v, DEFAULT_CLR) for v in ordered]
+            pct     = 100 * sum(vals) / max(total, 1)
+            fig, ax = plt.subplots(figsize=(8, 7))
+            fig.patch.set_facecolor(WHITE)
+            _donut(ax, ordered, vals, colors, "Visibility Composition",
+                   center_text=f"{pct:.0f}%\nannotated")
+            handles = [Patch(facecolor=c, edgecolor=WHITE, label=lbl)
+                       for c, lbl in zip(colors, ordered)]
+            leg = ax.legend(handles=handles,
+                            loc="lower center", bbox_to_anchor=(0.5, -0.08),
+                            ncol=3, fontsize=9, framealpha=0.95, edgecolor="#E2E8F0",
+                            columnspacing=1.0, handlelength=1.2)
+            leg.get_frame().set_linewidth(0.8)
+            plt.tight_layout(pad=1.5)
+            out = f"{base_path}_3b_visibility.png"
+            fig.savefig(out, dpi=200, bbox_inches="tight", facecolor=WHITE)
+            plt.close(fig)
+            saved.append(out)
+
         # ── per-habitat plots ──────────────────────────────────────────
         if all_habitats:
             hab_dir = base_path + "_habitat_plots"
@@ -2029,20 +3335,20 @@ class MainWindow(QMainWindow):
                 hab_slug  = hab.lower().replace(" ", "_")
                 hab_color = HAB_COLORS.get(hab, DEFAULT_CLR)
 
-                # ── behavior donut for this habitat ──────────────────
+                # ── movement donut for this habitat ──────────────────
                 beh_in_hab = Counter(
                     beh_timeline[f]
                     for f in range(total)
                     if hab_timeline[f] == hab and beh_timeline[f]
                 )
                 if beh_in_hab:
-                    ord_b = [b for b in BEHAVIOR_OPTIONS if b in beh_in_hab]
+                    ord_b = [b for b in MOVEMENT_OPTIONS if b in beh_in_hab]
                     ord_b += [b for b in beh_in_hab if b not in ord_b]
                     vals_b = [beh_in_hab[b] for b in ord_b]
                     cols_b = []
                     for b in ord_b:
                         try:
-                            cols_b.append(BEH_COLORS[BEHAVIOR_OPTIONS.index(b)
+                            cols_b.append(BEH_COLORS[MOVEMENT_OPTIONS.index(b)
                                                       % len(BEH_COLORS)])
                         except ValueError:
                             cols_b.append(DEFAULT_CLR)
@@ -2051,7 +3357,7 @@ class MainWindow(QMainWindow):
                     fig, ax = plt.subplots(figsize=(9, 7))
                     fig.patch.set_facecolor(WHITE)
                     _donut(ax, short_b, vals_b, cols_b,
-                           f"Behavior — {hab}", title_color=hab_color,
+                           f"Movement — {hab}", title_color=hab_color,
                            center_text=f"{sum(vals_b)}\nframes")
                     handles_b = [Patch(facecolor=c, edgecolor=WHITE, label=lbl)
                                  for c, lbl in zip(cols_b, short_b)]
@@ -2355,7 +3661,9 @@ class MainWindow(QMainWindow):
         total = self.total_frames
 
         hab_tl = self._propagate(store.habitat_per_frame)
-        beh_tl = self._propagate(store.behavior_per_frame)
+        mov_tl = self._propagate(store.movement_per_frame)
+        soc_tl = self._propagate(store.social_per_frame)
+        vis_tl = self._propagate(store.visibility_per_frame)
 
         HEADER_FILL = PatternFill("solid", fgColor="0F172A")
         HEADER_FONT = Font(color="FFFFFF", bold=True, size=10)
@@ -2383,7 +3691,8 @@ class MainWindow(QMainWindow):
         ws1 = wb.active
         ws1.title = "Sightings"
         _hrow(ws1, ["Frame", "Time", "Name", "Category", "Species",
-                    "Count", "Behavior", "Habitat"])
+                    "Count", "Confidence", "Sex",
+                    "Movement", "Social", "Habitat", "Visibility"])
         ws1.freeze_panes = "A2"
         for r, feat in enumerate(
                 sorted(store.features, key=lambda f: f.init_frame), 2):
@@ -2393,8 +3702,12 @@ class MainWindow(QMainWindow):
                 feat.species_category or "",
                 feat.species or "",
                 feat.count,
-                beh_tl[fi] or "",
+                feat.confidence or "",
+                feat.sex or "",
+                mov_tl[fi] or "",
+                soc_tl[fi] or "",
                 hab_tl[fi] or "",
+                vis_tl[fi] or "",
             ], 1):
                 cell = ws1.cell(row=r, column=c, value=v)
                 if r % 2 == 0:
@@ -2433,92 +3746,79 @@ class MainWindow(QMainWindow):
             ch.height = max(10, n * 0.55)
             ws2.add_chart(ch, "E2")
 
-        # ── Sheet 3: Behavior Summary + pie chart ─────────────────
-        ws3 = wb.create_sheet("Behavior Summary")
-        _hrow(ws3, ["Behavior", "Frames", "Duration (s)", "% of Annotated"])
-        ws3.freeze_panes = "A2"
-        beh_counts = Counter(b for b in beh_tl if b)
-        beh_total  = sum(beh_counts.values()) or 1
-        beh_rows   = [b for b in BEHAVIOR_OPTIONS if b in beh_counts]
-        beh_rows  += [b for b in beh_counts if b not in beh_rows]
-        for r, b in enumerate(beh_rows, 2):
-            f = beh_counts[b]
-            ws3.cell(row=r, column=1, value=b)
-            ws3.cell(row=r, column=2, value=f)
-            ws3.cell(row=r, column=3, value=round(f / fps, 2))
-            ws3.cell(row=r, column=4, value=round(100 * f / beh_total, 1))
-        _autowidth(ws3)
-        if beh_rows:
-            n  = len(beh_rows)
-            ch = PieChart()
-            ch.title  = "Behavior Distribution"
-            ch.style  = 10
-            ch.add_data(Reference(ws3, min_col=3, min_row=1, max_row=1+n),
-                        titles_from_data=True)
-            ch.set_categories(Reference(ws3, min_col=1, min_row=2, max_row=1+n))
-            ch.width  = 18
-            ch.height = 14
-            ws3.add_chart(ch, "F2")
+        # ── Summary sheets (Movement / Social / Habitat / Visibility) ─
+        def _summary_sheet(name, header, timeline, order, chart_title):
+            ws = wb.create_sheet(name)
+            _hrow(ws, [header, "Frames", "Duration (s)", "% of Annotated"])
+            ws.freeze_panes = "A2"
+            counts = Counter(v for v in timeline if v)
+            tot = sum(counts.values()) or 1
+            if order:
+                rows = [x for x in order if x in counts]
+                rows += [x for x in counts if x not in rows]
+            else:
+                rows = sorted(counts, key=lambda x: counts[x], reverse=True)
+            for r, x in enumerate(rows, 2):
+                f = counts[x]
+                ws.cell(row=r, column=1, value=x)
+                ws.cell(row=r, column=2, value=f)
+                ws.cell(row=r, column=3, value=round(f / fps, 2))
+                ws.cell(row=r, column=4, value=round(100 * f / tot, 1))
+            _autowidth(ws)
+            if rows:
+                n = len(rows)
+                ch = PieChart()
+                ch.title = chart_title
+                ch.style = 10
+                ch.add_data(Reference(ws, min_col=3, min_row=1, max_row=1 + n),
+                            titles_from_data=True)
+                ch.set_categories(Reference(ws, min_col=1, min_row=2, max_row=1 + n))
+                ch.width = 18
+                ch.height = 14
+                ws.add_chart(ch, "F2")
 
-        # ── Sheet 4: Habitat Summary + pie chart ──────────────────
-        ws4 = wb.create_sheet("Habitat Summary")
-        _hrow(ws4, ["Habitat", "Frames", "Duration (s)", "% of Annotated"])
-        ws4.freeze_panes = "A2"
-        hab_counts = Counter(h for h in hab_tl if h)
-        hab_total  = sum(hab_counts.values()) or 1
-        hab_rows   = sorted(hab_counts, key=lambda h: hab_counts[h], reverse=True)
-        for r, h in enumerate(hab_rows, 2):
-            f = hab_counts[h]
-            ws4.cell(row=r, column=1, value=h)
-            ws4.cell(row=r, column=2, value=f)
-            ws4.cell(row=r, column=3, value=round(f / fps, 2))
-            ws4.cell(row=r, column=4, value=round(100 * f / hab_total, 1))
-        _autowidth(ws4)
-        if hab_rows:
-            n  = len(hab_rows)
-            ch = PieChart()
-            ch.title  = "Habitat Distribution"
-            ch.style  = 10
-            ch.add_data(Reference(ws4, min_col=3, min_row=1, max_row=1+n),
-                        titles_from_data=True)
-            ch.set_categories(Reference(ws4, min_col=1, min_row=2, max_row=1+n))
-            ch.width  = 18
-            ch.height = 14
-            ws4.add_chart(ch, "F2")
+        _summary_sheet("Movement Summary", "Movement", mov_tl,
+                       MOVEMENT_OPTIONS, "Movement Distribution")
+        _summary_sheet("Social Summary", "Social", soc_tl,
+                       SOCIAL_OPTIONS, "Social Distribution")
+        _summary_sheet("Habitat Summary", "Habitat", hab_tl,
+                       None, "Habitat Distribution")
+        _summary_sheet("Visibility Summary", "Visibility", vis_tl,
+                       VISIBILITY_OPTIONS, "Visibility Distribution")
 
-        # ── Sheet 5: Behavior Timeline (segments) ─────────────────
-        ws5 = wb.create_sheet("Behavior Timeline")
-        _hrow(ws5, ["Start Frame", "Start Time", "End Frame",
-                    "End Time", "Duration (s)", "Behavior"])
-        ws5.freeze_panes = "A2"
-        for r, seg in enumerate(
-                (s for s in FeatureStore._compress_timeline(
-                    store.behavior_per_frame) if s.get("value")), 2):
-            dur = (seg["end"] - seg["start"] + 1) / fps
-            for c, v in enumerate([
-                seg["start"], _t(seg["start"]),
-                seg["end"],   _t(seg["end"]),
-                round(dur, 2), seg["value"],
-            ], 1):
-                ws5.cell(row=r, column=c, value=v)
-        _autowidth(ws5)
+        # ── Timeline sheets (segments) per axis ───────────────────
+        def _timeline_sheet(name, header, per_frame):
+            ws = wb.create_sheet(name)
+            _hrow(ws, ["Start Frame", "Start Time", "End Frame",
+                       "End Time", "Duration (s)", header])
+            ws.freeze_panes = "A2"
+            for r, seg in enumerate(
+                    (s for s in FeatureStore._compress_timeline(per_frame)
+                     if s.get("value")), 2):
+                dur = (seg["end"] - seg["start"] + 1) / fps
+                for c, v in enumerate([
+                    seg["start"], _t(seg["start"]),
+                    seg["end"], _t(seg["end"]),
+                    round(dur, 2), seg["value"],
+                ], 1):
+                    ws.cell(row=r, column=c, value=v)
+            _autowidth(ws)
 
-        # ── Sheet 6: Habitat Timeline (segments) ──────────────────
-        ws6 = wb.create_sheet("Habitat Timeline")
-        _hrow(ws6, ["Start Frame", "Start Time", "End Frame",
-                    "End Time", "Duration (s)", "Habitat"])
-        ws6.freeze_panes = "A2"
-        for r, seg in enumerate(
-                (s for s in FeatureStore._compress_timeline(
-                    store.habitat_per_frame) if s.get("value")), 2):
-            dur = (seg["end"] - seg["start"] + 1) / fps
-            for c, v in enumerate([
-                seg["start"], _t(seg["start"]),
-                seg["end"],   _t(seg["end"]),
-                round(dur, 2), seg["value"],
-            ], 1):
-                ws6.cell(row=r, column=c, value=v)
-        _autowidth(ws6)
+        _timeline_sheet("Movement Timeline", "Movement", store.movement_per_frame)
+        _timeline_sheet("Social Timeline", "Social", store.social_per_frame)
+        _timeline_sheet("Habitat Timeline", "Habitat", store.habitat_per_frame)
+        _timeline_sheet("Visibility Timeline", "Visibility", store.visibility_per_frame)
+
+        # ── Notes sheet ───────────────────────────────────────────
+        wsn = wb.create_sheet("Notes")
+        _hrow(wsn, ["Frame", "Time", "Note"])
+        wsn.freeze_panes = "A2"
+        for r, note in enumerate(sorted(store.notes, key=lambda n: n["frame"]), 2):
+            fi = int(note["frame"])
+            wsn.cell(row=r, column=1, value=fi)
+            wsn.cell(row=r, column=2, value=_t(fi))
+            wsn.cell(row=r, column=3, value=note.get("text", ""))
+        _autowidth(wsn)
 
         return wb
 
@@ -2542,23 +3842,6 @@ class MainWindow(QMainWindow):
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         w = cv2.VideoWriter(out_path, fourcc, self.fps, (self.video_w, self.video_h))
 
-        def draw_scene(frame, fidx):
-            beh = self.store.behavior_per_frame[fidx] or self._current_behavior
-            hab = self.store.habitat_per_frame[fidx] or self._current_habitat
-            text = f"{beh} • {hab}"
-            cv2.putText(frame, text, (14, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(frame, text, (14, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-
-        def feat_label(feat):
-            lbl = feat.species_category
-            if feat.species:
-                lbl = f"{feat.species_category}: {feat.species}"
-            if feat.count > 1:
-                lbl = f"{lbl} x{feat.count}"
-            return lbl
-
         if self.is_frame_dir:
             for fidx in range(self.total_frames):
                 frame = cv2.imread(self.frame_files[fidx])
@@ -2566,8 +3849,8 @@ class MainWindow(QMainWindow):
                     continue
                 for _, feat, mask, bbox in self.store.features_at(fidx):
                     bgr = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)][::-1]
-                    self._draw_mask(frame, mask, bgr, feat_label(feat), bbox)
-                draw_scene(frame, fidx)
+                    self._draw_mask(frame, mask, bgr, self._feature_label(feat), bbox)
+                self._draw_scene_overlay(frame, fidx)
                 w.write(frame)
         else:
             cap = cv2.VideoCapture(self.video_path)
@@ -2578,16 +3861,43 @@ class MainWindow(QMainWindow):
                     break
                 for _, feat, mask, bbox in self.store.features_at(fidx):
                     bgr = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)][::-1]
-                    self._draw_mask(frame, mask, bgr, feat_label(feat), bbox)
-                draw_scene(frame, fidx)
+                    self._draw_mask(frame, mask, bgr, self._feature_label(feat), bbox)
+                self._draw_scene_overlay(frame, fidx)
                 w.write(frame)
                 fidx += 1
             cap.release()
 
         w.release()
 
+    def _show_help(self):
+        QMessageBox.information(
+            self, "CTAG Annotator — Help",
+            "Labeling\n"
+            "  • Movement + Social + Habitat + Visibility bars label the current\n"
+            "    frame; the label persists on later frames until you change it.\n"
+            "  • ＋ buttons add new behaviors / species (saved to ~/CTAG_Annotator).\n\n"
+            "Bounding boxes\n"
+            "  • Draw Bbox → click TWO corners (right-click cancels).\n"
+            "  • Select a box in the list to drag its corners; Delete removes it.\n"
+            "  • Ctrl/⌘ + mouse-wheel (or +/- buttons) to zoom.\n\n"
+            "Highlight clips\n"
+            "  • Mark In / Mark Out (or Ctrl+I / Ctrl+O) set a range; Save Clip\n"
+            "    stores it; Export Clip writes an MP4 (optionally with overlays).\n\n"
+            "Other\n"
+            "  • ⌘Z / Ctrl+Z: undo.   ← / →: step frames.\n"
+            "  • Ctrl and +/- zoom.   Select a feature then Delete to remove it.\n"
+            "  • Work autosaves every 60 s next to the video; you're prompted to\n"
+            "    resume on reopen.  File menu opens other videos / folders.")
+
     # -------------------------------------------------------------- close
     def closeEvent(self, ev):
+        # persist work before closing
+        try:
+            self._autosave()
+        except Exception:
+            pass
+        if hasattr(self, "autosave_timer"):
+            self.autosave_timer.stop()
         if self.cap is not None:
             self.cap.release()
         if self.temp_dir and os.path.isdir(self.temp_dir):
@@ -2638,6 +3948,65 @@ def _extract_frames(video_path: str, out_dir: str) -> int:
     return idx
 
 
+def prepare_source(path: str, is_frame_dir: bool) -> dict:
+    """Resolve a user-chosen path into a frame source + metadata.
+
+    For a video file, frames are extracted to a temp dir (returned as temp_dir);
+    the caller owns cleanup.  Returns a dict consumed by MainWindow._switch_source
+    and main().  Raises RuntimeError on failure.
+    """
+    if is_frame_dir or os.path.isdir(path):
+        if not os.path.isdir(path):
+            raise RuntimeError(f"Frames directory not found: {path}")
+        jpegs = [fn for fn in os.listdir(path)
+                 if fn.lower().endswith(('.jpg', '.jpeg'))]
+        if not jpegs:
+            raise RuntimeError(f"No JPEG files found in: {path}")
+        first_file = sorted(jpegs, key=lambda fn: int(os.path.splitext(fn)[0]))[0]
+        first = cv2.imread(os.path.join(path, first_file))
+        if first is None:
+            raise RuntimeError(f"Cannot read first frame: {first_file}")
+        h, w = first.shape[:2]
+        frame_files = sorted(
+            [os.path.join(path, f) for f in jpegs],
+            key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+        return {
+            "frames_source": path, "is_frame_dir": True, "temp_dir": None,
+            "original": path, "frame_files": frame_files,
+            "total_frames": len(jpegs), "video_w": w, "video_h": h, "fps": 30.0,
+        }
+
+    # video file → extract frames to a temp dir
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Video not found: {path}")
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    temp_dir = tempfile.mkdtemp(prefix="ctag_frames_")
+    try:
+        n = _extract_frames(path, temp_dir)
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError(f"Frame extraction failed: {e}")
+    if n == 0:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError(f"No frames could be read from: {path}")
+    frame_files = sorted(
+        [os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
+         if f.lower().endswith('.jpg')],
+        key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+    return {
+        "frames_source": temp_dir, "is_frame_dir": True, "temp_dir": temp_dir,
+        "original": path, "frame_files": frame_files,
+        "total_frames": n, "video_w": w, "video_h": h, "fps": fps,
+    }
+
+
 def _enable_hidpi():
     """Best-effort crispness across Qt5/Qt6."""
     try:
@@ -2663,6 +4032,9 @@ def main():
                         help="Input is a directory of JPEG frames (not a video file)")
     args = parser.parse_args()
 
+    # Load user-editable species + behavior lists (seeds CSVs on first run)
+    load_all_label_config()
+
     _enable_hidpi()
     app = QApplication(sys.argv)
 
@@ -2676,84 +4048,41 @@ def main():
     f.setPointSize(12)
     app.setFont(f)
 
-    video_path = args.video
+    chosen = args.video
     is_frame_dir = args.frames_dir
-    temp_frames_dir = None
-    original_video_path = None
 
-    if is_frame_dir:
-        # --- frames directory mode (explicit --frames-dir flag) ---
-        if not video_path:
-            video_path = QFileDialog.getExistingDirectory(None, "Select frames directory")
-        if not video_path:
-            sys.exit(0)
-        if not os.path.isdir(video_path):
-            sys.exit(f"Frames directory not found: {video_path}")
-        jpegs = [fn for fn in os.listdir(video_path) if fn.lower().endswith(('.jpg', '.jpeg'))]
-        if not jpegs:
-            sys.exit(f"No JPEG files found in: {video_path}")
-        print(f"Found {len(jpegs)} JPEG frames")
-
-        # Derive video properties from first frame
-        first_file = sorted(jpegs, key=lambda fn: int(os.path.splitext(fn)[0]))[0]
-        first = cv2.imread(os.path.join(video_path, first_file))
-        if first is None:
-            sys.exit(f"Cannot read first frame: {first_file}")
-        video_h, video_w = first.shape[:2]
-        total_frames = len(jpegs)
-        fps = 30.0
-
-    else:
-        # --- video file mode: show dialog, then extract frames internally ---
-        if not video_path:
-            video_path, _ = QFileDialog.getOpenFileName(
+    # Resolve the initial source (dialogs if no path given)
+    if not chosen:
+        if is_frame_dir:
+            chosen = QFileDialog.getExistingDirectory(None, "Select frames directory")
+        else:
+            chosen, _ = QFileDialog.getOpenFileName(
                 None, "Open video", "",
-                "Video (*.mp4 *.MP4 *.mov *.avi *.mkv)"
-            )
-        if not video_path:
-            sys.exit(0)
-        if not os.path.isfile(video_path):
-            sys.exit(f"Video not found: {video_path}")
+                "Video (*.mp4 *.MP4 *.mov *.avi *.mkv)")
+    if not chosen:
+        sys.exit(0)
 
-        # Read video metadata before extracting
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            sys.exit(f"Cannot open video: {video_path}")
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        video_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
+    try:
+        prep = prepare_source(chosen, is_frame_dir)
+    except RuntimeError as e:
+        sys.exit(str(e))
 
-        original_video_path = video_path
-        temp_frames_dir = tempfile.mkdtemp(prefix="ctag_frames_")
-        print(f"Extracting frames to: {temp_frames_dir}")
-        try:
-            n_frames = _extract_frames(video_path, temp_frames_dir)
-        except Exception as e:
-            shutil.rmtree(temp_frames_dir, ignore_errors=True)
-            sys.exit(f"Frame extraction failed: {e}")
-        if n_frames == 0:
-            shutil.rmtree(temp_frames_dir, ignore_errors=True)
-            sys.exit(f"No frames could be read from: {video_path}")
-        print(f"Extracted {n_frames} frames")
-        total_frames = n_frames
-        video_path = temp_frames_dir
-        is_frame_dir = True
-
-    print(f"Opening annotator: {video_path}  ({total_frames} frames @ {fps:.2f} fps)")
+    print(f"Opening annotator: {prep['frames_source']}  "
+          f"({prep['total_frames']} frames @ {prep['fps']:.2f} fps)")
 
     win = MainWindow(
-        video_path=video_path,
-        fps=fps,
-        total_frames=total_frames,
-        video_w=video_w,
-        video_h=video_h,
-        is_frame_dir=is_frame_dir,
-        temp_dir=temp_frames_dir,
-        store_video_path=original_video_path,
+        video_path=prep["frames_source"],
+        fps=prep["fps"],
+        total_frames=prep["total_frames"],
+        video_w=prep["video_w"],
+        video_h=prep["video_h"],
+        is_frame_dir=prep["is_frame_dir"],
+        temp_dir=prep["temp_dir"],
+        store_video_path=prep["original"],
     )
-    win.resize(1320, 860)
+    win._playlist = [chosen]
+    win._refresh_playlist()
+    win.resize(1360, 900)
     win.show()
     sys.exit(app.exec())
 

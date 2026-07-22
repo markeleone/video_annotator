@@ -5,6 +5,8 @@ __pycache__/
 .venv
 *.egg*
 build/*
+dist/
+*.ctag_autosave.json
 _C.*
 outputs/*
 coreml_models/*
