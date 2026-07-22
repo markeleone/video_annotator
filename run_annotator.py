@@ -27,6 +27,7 @@ import hashlib
 import argparse
 import shutil
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
@@ -44,7 +45,7 @@ try:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
-        QScrollArea,
+        QScrollArea, QCheckBox,
     )
     _QT6 = True
 except ImportError:
@@ -55,7 +56,7 @@ except ImportError:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
-        QScrollArea,
+        QScrollArea, QCheckBox,
     )
     _QT6 = False
 
@@ -1393,6 +1394,15 @@ class AnnotationTimeline(QWidget):
                 p.setBrush(QColor(245, 158, 11, 90))
                 p.drawRoundedRect(xs, scrub_y + 2, max(2, xe - xs), row_h - 4, 4, 4)
 
+            # comment markers — small rose flags so you can spot "come back
+            # here" frames at a glance
+            p.setBrush(QColor(244, 63, 94))
+            p.setPen(Qt.PenStyle.NoPen if _QT6 else Qt.NoPen)
+            for note in getattr(self.store, "notes", []):
+                nx = _fx(int(note.get("frame", 0)))
+                p.drawEllipse(nx - 3, scrub_y - 4, 6, 6)
+                p.drawRect(nx - 1, scrub_y - 1, 2, row_h // 2)
+
         if self.clip_in is not None or self.clip_out is not None:
             a = self.clip_in if self.clip_in is not None else self.clip_out
             b = self.clip_out if self.clip_out is not None else self.clip_in
@@ -1479,7 +1489,16 @@ class MainWindow(QMainWindow):
 
         self.current_frame_idx = 0
         self.playing = False
-        self._labeling = True  # False = navigate-only, no label writes
+        self._labeling = True  # master switch: False = navigate-only
+        # per-axis labeling switches — lets you re-scrub a section overwriting
+        # only one axis (e.g. fix Habitat from Sand → Gravel without touching
+        # Movement/Social/Visibility)
+        self._label_axes = {"movement": True, "social": True,
+                            "habitat": True, "visibility": True}
+
+        # background preload of the next playlist video (path -> prep dict)
+        self._preload: Dict[str, dict] = {}
+        self._preload_inflight: Optional[str] = None
 
         # state — either use preloaded store or create fresh one
         store_path = store_video_path or video_path
@@ -1778,17 +1797,17 @@ class MainWindow(QMainWindow):
         clip_btn_row.addWidget(save_clip_btn)
         clip_btn_row.addWidget(del_clip_btn)
 
-        # ---- Timestamped notes ----
+        # ---- Timestamped comments ----
         self.notes_list = QListWidget()
-        self.notes_list.setMaximumHeight(120)
+        self.notes_list.setMaximumHeight(140)
         self.notes_list.itemDoubleClicked.connect(self._on_note_activated)
         self.note_edit = QLineEdit()
-        self.note_edit.setPlaceholderText("Note at current frame…")
+        self.note_edit.setPlaceholderText("Comment at current frame… e.g. 'ID this fish later'")
         self.note_edit.returnPressed.connect(self._add_note)
-        add_note_btn = QPushButton("Add Note")
+        add_note_btn = QPushButton("Add Comment")
         add_note_btn.setObjectName("Secondary")
         add_note_btn.clicked.connect(self._add_note)
-        del_note_btn = QPushButton("Delete Note")
+        del_note_btn = QPushButton("Delete Comment")
         del_note_btn.setObjectName("Secondary")
         del_note_btn.clicked.connect(self._delete_note)
         note_input_row = QHBoxLayout()
@@ -1807,7 +1826,7 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(QLabel("Annotated Features:"))
         card_layout.addWidget(self.feat_list, stretch=1)
         card_layout.addLayout(fa)
-        card_layout.addWidget(QLabel("Notes (double-click to jump):"))
+        card_layout.addWidget(QLabel("Comments (double-click to jump):"))
         card_layout.addWidget(self.notes_list)
         card_layout.addLayout(note_input_row)
         card_layout.addLayout(note_btn_row)
@@ -1881,6 +1900,20 @@ class MainWindow(QMainWindow):
         )
         self.label_mode_btn.clicked.connect(self._toggle_label_mode)
 
+        # Per-axis labeling checkboxes: untick an axis to protect it while
+        # re-scrubbing (e.g. fix only Habitat over an already-labeled section)
+        self._axis_checkboxes = {}
+        axis_row = QHBoxLayout()
+        axis_row.setSpacing(4)
+        for key, short in (("movement", "Mov"), ("social", "Soc"),
+                           ("habitat", "Hab"), ("visibility", "Vis")):
+            cb = QCheckBox(short)
+            cb.setChecked(True)
+            cb.setToolTip(f"Write {key} labels while playing/scrubbing")
+            cb.toggled.connect(lambda on, k=key: self._on_axis_toggle(k, on))
+            self._axis_checkboxes[key] = cb
+            axis_row.addWidget(cb)
+
         # Zoom controls
         zoom_out_btn = QPushButton("－")
         zoom_out_btn.setObjectName("Secondary")
@@ -1914,6 +1947,7 @@ class MainWindow(QMainWindow):
         ctrls.addWidget(zoom_in_btn)
         ctrls.addWidget(zoom_reset_btn)
         ctrls.addWidget(self.label_mode_btn)
+        ctrls.addLayout(axis_row)
         ctrls.addWidget(QLabel("Speed:"))
         ctrls.addWidget(self.speed_combo)
 
@@ -2197,6 +2231,8 @@ class MainWindow(QMainWindow):
             user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
             it.setData(user_role, note)
             self.notes_list.addItem(it)
+        if hasattr(self, "timeline"):
+            self.timeline.update()   # keep comment markers in sync
 
     def _add_note(self):
         text = (self.note_edit.text() or "").strip()
@@ -2393,19 +2429,34 @@ class MainWindow(QMainWindow):
         self._labeling = checked
         self.label_mode_btn.setText("Labeling: ON" if checked else "Labeling: OFF")
 
+    def _on_axis_toggle(self, axis: str, on: bool):
+        self._label_axes[axis] = on
+        active = [k for k, v in self._label_axes.items() if v]
+        self.statusBar().showMessage(
+            "Labeling axes: " + (", ".join(active) if active else "none"))
+
     def _on_speed_changed(self, text: str):
         self._play_speed = float(text.replace('x', ''))
         if self.timer.isActive():
             interval = max(1, int(33 / self._play_speed))
             self.timer.setInterval(interval)
 
+    def _write_labels_at(self, f: int):
+        """Write the current labels to frame f, honouring the per-axis toggles."""
+        ax = self._label_axes
+        if ax.get("movement", True):
+            self.store.set_movement(f, self._current_movement)
+        if ax.get("social", True):
+            self.store.set_social(f, self._current_social)
+        if ax.get("habitat", True):
+            self.store.set_habitat(f, self._current_habitat)
+        if ax.get("visibility", True):
+            self.store.set_visibility(f, self._current_visibility)
+
     def _on_slider_seek(self, idx: int):
         if self._labeling and idx > self.current_frame_idx:
             for f in range(self.current_frame_idx, idx + 1):
-                self.store.set_movement(f, self._current_movement)
-                self.store.set_social(f, self._current_social)
-                self.store.set_habitat(f, self._current_habitat)
-                self.store.set_visibility(f, self._current_visibility)
+                self._write_labels_at(f)
             if hasattr(self, "timeline"):
                 self.timeline.update()
         self.seek_to(idx)
@@ -2417,11 +2468,7 @@ class MainWindow(QMainWindow):
             self.timer.stop()
             return
         if self._labeling:
-            fi = self.current_frame_idx
-            self.store.set_movement(fi, self._current_movement)
-            self.store.set_social(fi, self._current_social)
-            self.store.set_habitat(fi, self._current_habitat)
-            self.store.set_visibility(fi, self._current_visibility)
+            self._write_labels_at(self.current_frame_idx)
         self.seek_to(self.current_frame_idx + 1)
 
     def seek_to(self, idx: int):
@@ -2945,6 +2992,7 @@ class MainWindow(QMainWindow):
         p, _ = QFileDialog.getOpenFileName(
             self, "Open video", "", "Video (*.mp4 *.MP4 *.mov *.avi *.mkv)")
         if p:
+            self._cleanup_preloads()
             self._playlist = [p]
             self._refresh_playlist()
             self._switch_source(p, is_frame_dir=False)
@@ -2952,6 +3000,7 @@ class MainWindow(QMainWindow):
     def _open_frames_dialog(self):
         d = QFileDialog.getExistingDirectory(self, "Open frames directory")
         if d:
+            self._cleanup_preloads()
             self._playlist = [d]
             self._refresh_playlist()
             self._switch_source(d, is_frame_dir=True)
@@ -2967,6 +3016,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Open folder",
                                     "No video files found in that folder.")
             return
+        self._cleanup_preloads()
         self._playlist = vids
         self._refresh_playlist()
         self._switch_source(vids[0], is_frame_dir=False)
@@ -2986,16 +3036,55 @@ class MainWindow(QMainWindow):
         p = self._playlist[i]
         self._switch_source(p, is_frame_dir=os.path.isdir(p))
 
+    # -- background preloading of the next playlist video ----------------
+    def _start_preload_next(self):
+        """Silently prepare the next playlist entry in a background thread."""
+        playlist = getattr(self, "_playlist", [])
+        if len(playlist) < 2 or self._preload_inflight is not None:
+            return
+        cur = self.store.video_path or self.video_path
+        try:
+            i = playlist.index(cur)
+        except ValueError:
+            i = -1
+        nxt = playlist[i + 1] if 0 <= i + 1 < len(playlist) else None
+        if not nxt or nxt in self._preload or nxt == cur:
+            return
+        self._preload_inflight = nxt
+
+        def worker(p=nxt):
+            try:
+                prep = prepare_source(p, os.path.isdir(p), silent=True)
+                self._preload[p] = prep
+            except Exception:
+                pass
+            finally:
+                self._preload_inflight = None
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.statusBar().showMessage(
+            f"Preloading next video in background: {os.path.basename(nxt)}", 4000)
+
+    def _cleanup_preloads(self):
+        """Delete temp frame dirs of preloads that were never used."""
+        for prep in self._preload.values():
+            td = prep.get("temp_dir")
+            if td and os.path.isdir(td):
+                shutil.rmtree(td, ignore_errors=True)
+        self._preload.clear()
+
     def _switch_source(self, path, is_frame_dir):
         # persist current work first
         self._autosave()
         if self.playing:
             self.toggle_play()
-        try:
-            prep = prepare_source(path, is_frame_dir)
-        except Exception as e:
-            QMessageBox.critical(self, "Open failed", str(e))
-            return
+        prep = self._preload.pop(path, None)   # instant if preloaded
+        if prep is None:
+            try:
+                prep = prepare_source(path, is_frame_dir)
+            except Exception as e:
+                QMessageBox.critical(self, "Open failed", str(e))
+                return
         # tear down old source
         if self.cap is not None:
             self.cap.release()
@@ -3041,6 +3130,8 @@ class MainWindow(QMainWindow):
         if old_temp and os.path.isdir(old_temp):
             shutil.rmtree(old_temp, ignore_errors=True)
         self._maybe_resume_autosave()
+        # start silently preparing the next playlist entry
+        self._start_preload_next()
 
     # -------------------------------------------------------------- export
     def _save_plots(self, base_path: str) -> list:
@@ -3990,7 +4081,12 @@ class MainWindow(QMainWindow):
             "Labeling\n"
             "  • Movement + Social + Habitat + Visibility bars label the current\n"
             "    frame; the label persists on later frames until you change it.\n"
-            "  • ＋ buttons add new behaviors / species (saved to ~/CTAG_Annotator).\n\n"
+            "  • Mov/Soc/Hab/Vis checkboxes (bottom bar) choose WHICH axes are\n"
+            "    written while playing — untick the others to re-do just one\n"
+            "    (e.g. fix Sand → Gravel without touching behavior labels).\n"
+            "  • ＋ buttons add new behaviors / species (saved to ~/CTAG_Annotator).\n"
+            "  • Comments: add one at any frame ('ID this fish later'); rose\n"
+            "    markers show them on the timeline; double-click to jump back.\n\n"
             "Bounding boxes\n"
             "  • Draw Bbox → click TWO corners (right-click cancels).\n"
             "  • Select a box in the list to drag its corners; Delete removes it.\n"
@@ -4020,6 +4116,7 @@ class MainWindow(QMainWindow):
             self.cap.release()
         if self.temp_dir and os.path.isdir(self.temp_dir):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
+        self._cleanup_preloads()
         ev.accept()
 
 
@@ -4027,25 +4124,28 @@ class MainWindow(QMainWindow):
 # CLI helpers
 # --------------------------------------------------------------------------
 
-def _extract_frames(video_path: str, out_dir: str) -> int:
+def _extract_frames(video_path: str, out_dir: str, show_progress: bool = True) -> int:
     """Extract every frame from video_path as a JPEG into out_dir using cv2.
 
     Files are named 00000.jpg, 00001.jpg … so MainWindow's frame-dir loader
     can sort them by integer stem. Returns the number of frames written.
+    With show_progress=False this touches no Qt objects at all, so it is safe
+    to call from a background thread (used for next-video preloading).
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    modal = Qt.WindowModality.ApplicationModal if _QT6 else Qt.ApplicationModal
-
-    dlg = QProgressDialog("Extracting frames...", None, 0, max(total, 1))
-    dlg.setWindowTitle("Loading video")
-    dlg.setMinimumDuration(0)
-    dlg.setWindowModality(modal)
-    dlg.setValue(0)
-    dlg.show()
+    dlg = None
+    if show_progress:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        modal = Qt.WindowModality.ApplicationModal if _QT6 else Qt.ApplicationModal
+        dlg = QProgressDialog("Extracting frames...", None, 0, max(total, 1))
+        dlg.setWindowTitle("Loading video")
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(modal)
+        dlg.setValue(0)
+        dlg.show()
 
     idx = 0
     while True:
@@ -4058,20 +4158,23 @@ def _extract_frames(video_path: str, out_dir: str) -> int:
             [cv2.IMWRITE_JPEG_QUALITY, 95],
         )
         idx += 1
-        dlg.setValue(idx)
-        QApplication.processEvents()
+        if dlg is not None:
+            dlg.setValue(idx)
+            QApplication.processEvents()
 
     cap.release()
-    dlg.close()
+    if dlg is not None:
+        dlg.close()
     return idx
 
 
-def prepare_source(path: str, is_frame_dir: bool) -> dict:
+def prepare_source(path: str, is_frame_dir: bool, silent: bool = False) -> dict:
     """Resolve a user-chosen path into a frame source + metadata.
 
     For a video file, frames are extracted to a temp dir (returned as temp_dir);
     the caller owns cleanup.  Returns a dict consumed by MainWindow._switch_source
-    and main().  Raises RuntimeError on failure.
+    and main().  Raises RuntimeError on failure.  silent=True suppresses the Qt
+    progress dialog so this can run in a background preload thread.
     """
     if is_frame_dir or os.path.isdir(path):
         if not os.path.isdir(path):
@@ -4107,7 +4210,7 @@ def prepare_source(path: str, is_frame_dir: bool) -> dict:
 
     temp_dir = tempfile.mkdtemp(prefix="ctag_frames_")
     try:
-        n = _extract_frames(path, temp_dir)
+        n = _extract_frames(path, temp_dir, show_progress=not silent)
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise RuntimeError(f"Frame extraction failed: {e}")
@@ -4200,6 +4303,7 @@ def main():
     )
     win._playlist = [chosen]
     win._refresh_playlist()
+    win._start_preload_next()
     win.resize(1360, 900)
     win.show()
     sys.exit(app.exec())
