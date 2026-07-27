@@ -45,7 +45,7 @@ try:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
-        QScrollArea, QCheckBox,
+        QScrollArea, QCheckBox, QDialog, QTabWidget, QInputDialog,
     )
     _QT6 = True
 except ImportError:
@@ -56,7 +56,7 @@ except ImportError:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
-        QScrollArea, QCheckBox,
+        QScrollArea, QCheckBox, QDialog, QTabWidget, QInputDialog,
     )
     _QT6 = False
 
@@ -90,15 +90,17 @@ SOCIAL_OPTIONS_DEFAULT = [
 MOVEMENT_OPTIONS = list(MOVEMENT_OPTIONS_DEFAULT)
 SOCIAL_OPTIONS = list(SOCIAL_OPTIONS_DEFAULT)
 
-# Water visibility — its own persist-until-changed axis, so each stretch of
-# footage carries how observable interactions/substrate were.
-VISIBILITY_OPTIONS = ["Good", "Moderate", "Poor"]
+# Water visibility — its own persist-until-changed axis (fixed 5-point scale).
+VISIBILITY_OPTIONS = ["Very bad", "Bad", "Fine", "Good", "Very good"]
 
 # Per-feature metadata option lists
 CONFIDENCE_OPTIONS = ["", "High", "Medium", "Low"]
 SEX_OPTIONS = ["", "Male", "Female", "Unknown"]
 
-HABITAT_OPTIONS = ["Mangrove", "Rocky reef", "Sandy bottom", "Gravel", "Mud"]
+# Habitats are user-editable (like behaviors/species). These are the defaults
+# used to seed habitats.csv on first run; runtime uses whatever's in the CSV.
+HABITAT_OPTIONS_DEFAULT = ["Mangrove", "Rocky reef", "Sandy bottom", "Gravel", "Mud"]
+HABITAT_OPTIONS = list(HABITAT_OPTIONS_DEFAULT)
 
 SPECIES_CATEGORIES = {
     "Shark": [
@@ -441,6 +443,7 @@ ALL_SPECIES = [s for species in SPECIES_CATEGORIES.values() for s in species]
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), "CTAG_Annotator")
 SPECIES_CSV = os.path.join(CONFIG_DIR, "species.csv")
 BEHAVIORS_CSV = os.path.join(CONFIG_DIR, "behaviors.csv")
+HABITATS_CSV = os.path.join(CONFIG_DIR, "habitats.csv")
 # Guaranteed-local place for annotations/autosaves — lives in the user's home
 # (NOT inside any cloud-synced mount), so saves work even when the *video* is
 # streamed from Google Drive / iCloud / Dropbox / OneDrive.
@@ -557,36 +560,193 @@ def load_behaviors_config():
             social or list(SOCIAL_OPTIONS_DEFAULT))
 
 
-def append_species_to_csv(category: str, species: str):
-    """Append one (category, species) row to species.csv (best effort)."""
+def _seed_habitats_csv():
     _ensure_config_dir()
-    write_header = not os.path.exists(SPECIES_CSV)
-    with open(SPECIES_CSV, "a", newline="", encoding="utf-8") as f:
+    with open(HABITATS_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        if write_header:
-            w.writerow(["category", "species"])
-        w.writerow([category, species])
+        w.writerow(["habitat"])
+        for h in HABITAT_OPTIONS_DEFAULT:
+            w.writerow([h])
+
+
+def load_habitats_config():
+    """Return the habitat list from habitats.csv, seeding first run."""
+    if not os.path.exists(HABITATS_CSV):
+        try:
+            _seed_habitats_csv()
+        except OSError:
+            return list(HABITAT_OPTIONS_DEFAULT)
+    out = []
+    try:
+        with open(HABITATS_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                h = (row.get("habitat") or "").strip()
+                if h and h not in out:
+                    out.append(h)
+    except (OSError, csv.Error):
+        return list(HABITAT_OPTIONS_DEFAULT)
+    return out or list(HABITAT_OPTIONS_DEFAULT)
+
+
+# ---- full-file writers (used by add / remove / import / restore) ----------
+
+def write_species_csv(cats: Dict[str, list]):
+    _ensure_config_dir()
+    with open(SPECIES_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["category", "species"])
+        for cat, sps in cats.items():
+            if sps:
+                for s in sps:
+                    w.writerow([cat, s])
+            else:
+                w.writerow([cat, ""])
+
+
+def write_behaviors_csv(movement: list, social: list):
+    _ensure_config_dir()
+    with open(BEHAVIORS_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["axis", "label"])
+        for lab in movement:
+            w.writerow(["movement", lab])
+        for lab in social:
+            w.writerow(["social", lab])
+
+
+def write_habitats_csv(habs: list):
+    _ensure_config_dir()
+    with open(HABITATS_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["habitat"])
+        for h in habs:
+            w.writerow([h])
+
+
+def append_species_to_csv(category: str, species: str):
+    SPECIES_CATEGORIES.setdefault(category, [])
+    if species not in SPECIES_CATEGORIES[category]:
+        SPECIES_CATEGORIES[category].append(species)
+    write_species_csv(SPECIES_CATEGORIES)
 
 
 def append_behavior_to_csv(axis: str, label: str):
-    """Append one (axis, label) row to behaviors.csv (best effort)."""
-    _ensure_config_dir()
-    write_header = not os.path.exists(BEHAVIORS_CSV)
-    with open(BEHAVIORS_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(["axis", "label"])
-        w.writerow([axis, label])
+    lst = MOVEMENT_OPTIONS if axis == "movement" else SOCIAL_OPTIONS
+    if label not in lst:
+        lst.append(label)
+    write_behaviors_csv(MOVEMENT_OPTIONS, SOCIAL_OPTIONS)
+
+
+def import_species_csv(path: str, replace: bool = True):
+    """Import a CSV of species. Accepts 'category,species' rows, or a single
+    column of species names (imported under 'Other')."""
+    imported: Dict[str, list] = {}
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        raise ValueError("CSV is empty.")
+    start = 0
+    header = [c.strip().lower() for c in rows[0]]
+    two_col = len(header) >= 2 and ("categor" in header[0])
+    one_col_hdr = len(header) >= 1 and header[0] in ("species", "name")
+    if two_col or one_col_hdr:
+        start = 1
+    for row in rows[start:]:
+        if not row:
+            continue
+        if len(row) >= 2 and (two_col or not one_col_hdr):
+            cat = (row[0] or "").strip() or "Other"
+            sp = (row[1] or "").strip()
+        else:
+            cat, sp = "Other", (row[0] or "").strip()
+        if not sp:
+            continue
+        imported.setdefault(cat, [])
+        if sp not in imported[cat]:
+            imported[cat].append(sp)
+    if not imported:
+        raise ValueError("No species rows found in the CSV.")
+    global SPECIES_CATEGORIES
+    if replace:
+        merged = {c: [] for c in SPECIES_CATEGORY_ORDER}
+        merged.update(imported)
+    else:
+        merged = {c: list(v) for c, v in SPECIES_CATEGORIES.items()}
+        for c, sps in imported.items():
+            merged.setdefault(c, [])
+            for s in sps:
+                if s not in merged[c]:
+                    merged[c].append(s)
+    write_species_csv(merged)
+
+
+def import_behaviors_csv(path: str, replace: bool = True):
+    """Import 'axis,label' rows (axis = movement|social)."""
+    mov, soc = [], []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    for i, row in enumerate(rows):
+        if not row:
+            continue
+        if i == 0 and len(row) >= 2 and row[0].strip().lower().startswith("axis"):
+            continue
+        axis = (row[0] or "").strip().lower() if len(row) >= 2 else ""
+        lab = (row[1] if len(row) >= 2 else row[0]).strip()
+        if not lab:
+            continue
+        if axis == "social":
+            soc.append(lab)
+        else:
+            mov.append(lab)
+    if not mov and not soc:
+        raise ValueError("No behavior rows found in the CSV.")
+    if replace:
+        write_behaviors_csv(mov or list(MOVEMENT_OPTIONS),
+                            soc or list(SOCIAL_OPTIONS))
+    else:
+        write_behaviors_csv(MOVEMENT_OPTIONS + [m for m in mov if m not in MOVEMENT_OPTIONS],
+                            SOCIAL_OPTIONS + [s for s in soc if s not in SOCIAL_OPTIONS])
+
+
+def import_habitats_csv(path: str, replace: bool = True):
+    """Import a single column of habitat names (optional 'habitat' header)."""
+    habs = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for i, row in enumerate(csv.reader(f)):
+            if not row:
+                continue
+            h = (row[0] or "").strip()
+            if i == 0 and h.lower() == "habitat":
+                continue
+            if h and h not in habs:
+                habs.append(h)
+    if not habs:
+        raise ValueError("No habitat rows found in the CSV.")
+    if replace:
+        write_habitats_csv(habs)
+    else:
+        write_habitats_csv(HABITAT_OPTIONS + [h for h in habs if h not in HABITAT_OPTIONS])
+
+
+def restore_default(kind: str):
+    """Restore one label category to the built-in defaults."""
+    if kind == "species":
+        write_species_csv({c: list(v) for c, v in SPECIES_CATEGORIES_DEFAULT.items()})
+    elif kind == "behaviors":
+        write_behaviors_csv(list(MOVEMENT_OPTIONS_DEFAULT), list(SOCIAL_OPTIONS_DEFAULT))
+    elif kind == "habitats":
+        write_habitats_csv(list(HABITAT_OPTIONS_DEFAULT))
 
 
 def load_all_label_config():
     """Populate the runtime global label lists from the CSV config files."""
     global SPECIES_CATEGORIES, SPECIES_CATEGORY_ORDER, ALL_SPECIES
-    global MOVEMENT_OPTIONS, SOCIAL_OPTIONS
+    global MOVEMENT_OPTIONS, SOCIAL_OPTIONS, HABITAT_OPTIONS
     SPECIES_CATEGORIES = load_species_config()
     SPECIES_CATEGORY_ORDER = list(SPECIES_CATEGORIES.keys())
     ALL_SPECIES = [s for sps in SPECIES_CATEGORIES.values() for s in sps]
     MOVEMENT_OPTIONS, SOCIAL_OPTIONS = load_behaviors_config()
+    HABITAT_OPTIONS = load_habitats_config()
 
 
 # Modern-ish palette (RGB) for tracked features
@@ -712,7 +872,31 @@ class TrackedFeature:
     species_category: str = ""  # Shark / Ray / Teleost fish / Sea turtle / Other
     species: str = ""           # specific species name (or family, for hard IDs)
     confidence: str = ""        # "" | High | Medium | Low
-    sex: str = ""               # "" | Male | Female | Unknown
+    sex: str = ""               # "" | Male | Female | Unknown (single/first animal)
+    # per-individual sexes for a group (e.g. several sharks in one interaction);
+    # when non-empty, len(sexes) is the group size and drives `count`
+    sexes: list = None
+
+    def __post_init__(self):
+        if self.sexes is None:
+            self.sexes = []
+
+    def sex_summary(self) -> str:
+        """Compact '2♂ 1♀ 1?' string, or '' if no per-individual sexes."""
+        if not self.sexes:
+            return ""
+        n = {"Male": 0, "Female": 0, "Unknown": 0}
+        for s in self.sexes:
+            if s in n:
+                n[s] += 1
+        parts = []
+        if n["Male"]:
+            parts.append(f"{n['Male']}♂")
+        if n["Female"]:
+            parts.append(f"{n['Female']}♀")
+        if n["Unknown"]:
+            parts.append(f"{n['Unknown']}?")
+        return " ".join(parts)
 
 
 class FeatureStore:
@@ -740,6 +924,9 @@ class FeatureStore:
 
         # timestamped notes: list of {"frame": int, "text": str}
         self.notes: List[Dict] = []
+
+        # a single free-text note for the whole video
+        self.video_note: str = ""
 
         # saved highlight clips: list of {"name": str, "start": int, "end": int}
         self.clips: List[Dict] = []
@@ -828,6 +1015,7 @@ class FeatureStore:
                 "visibility_segments": self._compress_timeline(self.visibility_per_frame),
             },
             "notes": [dict(n) for n in self.notes],
+            "video_note": self.video_note,
             "clips": [dict(c) for c in self.clips],
             "features": [],
         }
@@ -844,6 +1032,7 @@ class FeatureStore:
                 "species": feat.species,
                 "confidence": feat.confidence,
                 "sex": feat.sex,
+                "sexes": list(feat.sexes or []),
                 "bboxes": {str(k): list(v) for k, v in self.feature_bboxes[i].items()},
             })
         with open(path, "w") as f:
@@ -889,6 +1078,7 @@ class FeatureStore:
             except (KeyError, ValueError, TypeError):
                 continue
         store.notes.sort(key=lambda n: n["frame"])
+        store.video_note = str(data.get("video_note", "") or "")
 
         for cd in data.get("clips", []):
             try:
@@ -911,6 +1101,7 @@ class FeatureStore:
                 species=fd.get("species", ""),
                 confidence=fd.get("confidence", ""),
                 sex=fd.get("sex", ""),
+                sexes=list(fd.get("sexes", []) or []),
             )
             bboxes_raw = fd.get("bboxes", {})
             bboxes: Dict[int, Tuple[int, int, int, int]] = {
@@ -929,10 +1120,11 @@ class FeatureStore:
 # --------------------------------------------------------------------------
 
 class VideoLabel(QLabel):
-    pointClicked = pyqtSignal(object)           # QPoint
+    pointClicked = pyqtSignal(object)           # QPoint — click on empty area
     bboxDrawn = pyqtSignal(object, object)      # two-click: start,end (label coords)
     bboxEdited = pyqtSignal(int, int, int, int)  # edited box (label coords)
     zoomRequested = pyqtSignal(int, object)      # wheel delta, anchor QPoint
+    firstCornerPlaced = pyqtSignal()             # first of the two draw-clicks
 
     HANDLE = 9  # corner-handle hit radius / draw size (px)
 
@@ -1004,17 +1196,20 @@ class VideoLabel(QLabel):
             if self._first_corner is None:
                 self._first_corner = pos
                 self._cursor_pos = pos
+                self.firstCornerPlaced.emit()
             else:
                 self.bboxDrawn.emit(self._first_corner, pos)
                 self._first_corner = None
             self.update()
             return
 
-        # not drawing → maybe editing a selected box
+        # not drawing → maybe editing a selected box, else a plain click
         h = self._handle_at(pos)
         if h is not None:
             self._active_handle = h
             self._drag_origin = pos
+        else:
+            self.pointClicked.emit(pos)
 
     def mouseMoveEvent(self, ev):
         pos = self._ev_pos(ev)
@@ -1158,21 +1353,27 @@ class AnnotationTimeline(QWidget):
         }
         self._social_colors[None] = QColor(203, 213, 225)
 
-        # Colors for habitat segments
-        self._habitat_colors = {
+        # Colors for habitat segments — known habitats get fixed colors, any
+        # user-added ones fall back to the palette by index.
+        _known_hab = {
             "Mangrove": QColor(16, 185, 129),
             "Rocky reef": QColor(14, 165, 233),
             "Sandy bottom": QColor(245, 158, 11),
             "Gravel": QColor(156, 163, 175),
             "Mud": QColor(120, 100, 80),
-            None: QColor(203, 213, 225),
         }
+        self._habitat_colors = {None: QColor(203, 213, 225)}
+        for i, h in enumerate(HABITAT_OPTIONS):
+            self._habitat_colors[h] = _known_hab.get(
+                h, QColor(*FEATURE_COLORS[i % len(FEATURE_COLORS)]))
 
-        # Colors for visibility segments
+        # Colors for the 5-point visibility scale (red → green)
         self._visibility_colors = {
+            "Very bad": QColor(190, 18, 60),
+            "Bad": QColor(239, 68, 68),
+            "Fine": QColor(245, 158, 11),
             "Good": QColor(34, 197, 94),
-            "Moderate": QColor(245, 158, 11),
-            "Poor": QColor(239, 68, 68),
+            "Very good": QColor(21, 128, 61),
             None: QColor(203, 213, 225),
         }
 
@@ -1449,6 +1650,205 @@ class AnnotationTimeline(QWidget):
 
 
 # --------------------------------------------------------------------------
+# Label manager — add/remove/import/restore for behaviors, habitats, species
+# --------------------------------------------------------------------------
+
+class _ListEditor(QWidget):
+    """A titled list with Add / Remove / Import CSV / Restore-default buttons.
+    Edits an in-memory list; the owning dialog commits to CSV on OK."""
+
+    def __init__(self, title, items, kind, importer, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.importer = importer     # callable(path, replace) or None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lab = QLabel(title)
+        lab.setObjectName("BarTitle")
+        lay.addWidget(lab)
+        self.list = QListWidget()
+        self.list.addItems(items)
+        lay.addWidget(self.list, stretch=1)
+        row = QHBoxLayout()
+        for text, fn in (("Add", self._add), ("Remove", self._remove),
+                         ("Import CSV", self._import), ("Restore default", self._restore)):
+            b = QPushButton(text)
+            b.setObjectName("Secondary")
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+
+    def values(self):
+        return [self.list.item(i).text() for i in range(self.list.count())]
+
+    def _set(self, items):
+        self.list.clear()
+        self.list.addItems(items)
+
+    def _add(self):
+        text, ok = QInputDialog.getText(self, "Add", f"New {self.kind}:")
+        if ok and text.strip() and text.strip() not in self.values():
+            self.list.addItem(text.strip())
+
+    def _remove(self):
+        for it in self.list.selectedItems():
+            self.list.takeItem(self.list.row(it))
+
+    def _import(self):
+        if self.importer is None:
+            return
+        p, _ = QFileDialog.getOpenFileName(self, "Import CSV", "", "CSV (*.csv)")
+        if not p:
+            return
+        try:
+            self.importer(p, replace=True)
+            load_all_label_config()
+            self._set(self._current_from_globals())
+            QMessageBox.information(self, "Imported", f"Imported labels from:\n{p}")
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", str(e))
+
+    def _restore(self):
+        try:
+            restore_default(self._restore_kind())
+            load_all_label_config()
+            self._set(self._current_from_globals())
+        except Exception as e:
+            QMessageBox.critical(self, "Restore failed", str(e))
+
+    # hooks overridden per-instance
+    def _current_from_globals(self):
+        return self.values()
+
+    def _restore_kind(self):
+        return "behaviors"
+
+
+class LabelManagerDialog(QDialog):
+    """Manage Movement / Social / Habitat / Species label sets."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage labels")
+        self.resize(560, 460)
+        v = QVBoxLayout(self)
+        info = QLabel("Add or remove labels, import a CSV, or restore a category "
+                      "to the built-in defaults. Changes apply when you click Save.")
+        info.setObjectName("Subtle")
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        tabs = QTabWidget()
+        self.mov = _ListEditor("Movement behaviors", MOVEMENT_OPTIONS, "movement behavior",
+                               import_behaviors_csv)
+        self.mov._current_from_globals = lambda: list(MOVEMENT_OPTIONS)
+        self.mov._restore_kind = lambda: "behaviors"
+        self.soc = _ListEditor("Social behaviors", SOCIAL_OPTIONS, "social behavior",
+                               import_behaviors_csv)
+        self.soc._current_from_globals = lambda: list(SOCIAL_OPTIONS)
+        self.soc._restore_kind = lambda: "behaviors"
+        self.hab = _ListEditor("Habitats", HABITAT_OPTIONS, "habitat", import_habitats_csv)
+        self.hab._current_from_globals = lambda: list(HABITAT_OPTIONS)
+        self.hab._restore_kind = lambda: "habitats"
+        tabs.addTab(self.mov, "Movement")
+        tabs.addTab(self.soc, "Social")
+        tabs.addTab(self.hab, "Habitats")
+        tabs.addTab(self._species_tab(), "Species")
+        v.addWidget(tabs, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("Secondary")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.clicked.connect(self._commit)
+        btn_row.addWidget(cancel)
+        btn_row.addWidget(save)
+        v.addLayout(btn_row)
+
+    def _species_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(6, 6, 6, 6)
+        self.sp_cat = QComboBox()
+        self.sp_cat.addItems(SPECIES_CATEGORY_ORDER)
+        self.sp_cat.currentTextChanged.connect(self._reload_species_list)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Category:"))
+        top.addWidget(self.sp_cat, stretch=1)
+        lay.addLayout(top)
+        self.sp_list = QListWidget()
+        lay.addWidget(self.sp_list, stretch=1)
+        row = QHBoxLayout()
+        for text, fn in (("Add", self._sp_add), ("Remove", self._sp_remove),
+                         ("Import CSV", self._sp_import),
+                         ("Restore default", self._sp_restore)):
+            b = QPushButton(text)
+            b.setObjectName("Secondary")
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        # working copy of the species dict, committed on Save
+        self._sp_work = {c: list(v) for c, v in SPECIES_CATEGORIES.items()}
+        self._reload_species_list()
+        return w
+
+    def _reload_species_list(self, *_):
+        cat = self.sp_cat.currentText()
+        self.sp_list.clear()
+        self.sp_list.addItems(self._sp_work.get(cat, []))
+
+    def _sp_add(self):
+        cat = self.sp_cat.currentText()
+        text, ok = QInputDialog.getText(self, "Add species", f"New species in {cat}:")
+        if ok and text.strip():
+            self._sp_work.setdefault(cat, [])
+            if text.strip() not in self._sp_work[cat]:
+                self._sp_work[cat].append(text.strip())
+                self._reload_species_list()
+
+    def _sp_remove(self):
+        cat = self.sp_cat.currentText()
+        for it in self.sp_list.selectedItems():
+            try:
+                self._sp_work[cat].remove(it.text())
+            except (KeyError, ValueError):
+                pass
+        self._reload_species_list()
+
+    def _sp_import(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Import species CSV", "", "CSV (*.csv)")
+        if not p:
+            return
+        try:
+            import_species_csv(p, replace=True)
+            load_all_label_config()
+            self._sp_work = {c: list(v) for c, v in SPECIES_CATEGORIES.items()}
+            self.sp_cat.blockSignals(True)
+            self.sp_cat.clear()
+            self.sp_cat.addItems(SPECIES_CATEGORY_ORDER)
+            self.sp_cat.blockSignals(False)
+            self._reload_species_list()
+            QMessageBox.information(self, "Imported", f"Imported species from:\n{p}")
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", str(e))
+
+    def _sp_restore(self):
+        restore_default("species")
+        load_all_label_config()
+        self._sp_work = {c: list(v) for c, v in SPECIES_CATEGORIES.items()}
+        self._reload_species_list()
+
+    def _commit(self):
+        write_behaviors_csv(self.mov.values(), self.soc.values())
+        write_habitats_csv(self.hab.values())
+        write_species_csv(self._sp_work)
+        load_all_label_config()
+        self.accept()
+
+
+# --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
 
@@ -1514,7 +1914,9 @@ class MainWindow(QMainWindow):
         self._current_movement = MOVEMENT_OPTIONS[0]
         self._current_social = SOCIAL_OPTIONS[0]
         self._current_habitat = HABITAT_OPTIONS[0]
-        self._current_visibility = VISIBILITY_OPTIONS[0]
+        # default visibility to the middle of the scale ("Fine"), not "Very bad"
+        self._current_visibility = (VISIBILITY_OPTIONS[len(VISIBILITY_OPTIONS) // 2]
+                                    if VISIBILITY_OPTIONS else "Fine")
         self._type_counters: Dict[str, int] = {}
 
         # selection + editing
@@ -1642,9 +2044,10 @@ class MainWindow(QMainWindow):
             self._make_segment_bar(
                 "Social:", SOCIAL_OPTIONS, self._on_social_selected,
                 on_add=lambda: self._add_behavior_dialog("social"))
-        self.habitat_bar, self._habitat_btns, _ = self._make_segment_bar(
-            "Habitat:", HABITAT_OPTIONS, self._on_habitat_selected
-        )
+        self.habitat_bar, self._habitat_btns, self._habitat_append = \
+            self._make_segment_bar(
+                "Habitat:", HABITAT_OPTIONS, self._on_habitat_selected,
+                on_add=self._add_habitat_dialog)
         self.visibility_bar, self._visibility_btns, _ = self._make_segment_bar(
             "Visibility:", VISIBILITY_OPTIONS, self._on_visibility_selected
         )
@@ -1662,6 +2065,7 @@ class MainWindow(QMainWindow):
         video_col.addWidget(self.social_bar)
         video_col.addWidget(self.habitat_bar)
         video_col.addWidget(self.visibility_bar)
+        self._video_col = video_col
 
         video_wrap = QWidget()
         video_wrap.setLayout(video_col)
@@ -1739,25 +2143,34 @@ class MainWindow(QMainWindow):
         species_row.addWidget(self.species_combo, stretch=1)
         species_row.addWidget(self.add_species_btn)
 
-        # Count spinbox
+        # Count spinbox + confidence
         self.count_spin = QSpinBox()
         self.count_spin.setMinimum(1)
         self.count_spin.setMaximum(9999)
         self.count_spin.setValue(1)
-
-        # Confidence + Sex combos
         self.confidence_combo = QComboBox()
         self.confidence_combo.addItems(CONFIDENCE_OPTIONS)
-        self.sex_combo = QComboBox()
-        self.sex_combo.addItems(SEX_OPTIONS)
 
         count_row = QHBoxLayout()
         count_row.addWidget(QLabel("Count:"))
         count_row.addWidget(self.count_spin, stretch=1)
         count_row.addWidget(QLabel("Conf:"))
         count_row.addWidget(self.confidence_combo, stretch=1)
-        count_row.addWidget(QLabel("Sex:"))
-        count_row.addWidget(self.sex_combo, stretch=1)
+
+        # Per-individual sex breakdown (mainly for sharks): how many ♂ / ♀ / ?
+        # When any of these is > 0 it overrides Count and records each animal's sex.
+        self.male_spin = QSpinBox(); self.male_spin.setRange(0, 9999)
+        self.female_spin = QSpinBox(); self.female_spin.setRange(0, 9999)
+        self.unknown_spin = QSpinBox(); self.unknown_spin.setRange(0, 9999)
+        for sp in (self.male_spin, self.female_spin, self.unknown_spin):
+            sp.setToolTip("Number of sharks of this sex in the interaction")
+        sex_row = QHBoxLayout()
+        sex_lbl = QLabel("Sex:")
+        sex_lbl.setToolTip("Record the sex of each shark — set ♂ / ♀ / unknown counts")
+        sex_row.addWidget(sex_lbl)
+        sex_row.addWidget(QLabel("♂")); sex_row.addWidget(self.male_spin, stretch=1)
+        sex_row.addWidget(QLabel("♀")); sex_row.addWidget(self.female_spin, stretch=1)
+        sex_row.addWidget(QLabel("?")); sex_row.addWidget(self.unknown_spin, stretch=1)
 
         # Draw bbox toggle button
         self.bbox_btn = QPushButton("Draw Bbox")
@@ -1768,6 +2181,10 @@ class MainWindow(QMainWindow):
         self.video_label.bboxDrawn.connect(self._on_bbox)
         self.video_label.bboxEdited.connect(self._on_bbox_edited)
         self.video_label.zoomRequested.connect(self._on_wheel_zoom)
+        self.video_label.pointClicked.connect(self._on_video_click)
+        self.video_label.firstCornerPlaced.connect(
+            lambda: self.statusBar().showMessage(
+                "Now click the opposite corner (right-click to cancel)."))
 
         # ---- Highlight clips ----
         self.clip_range_lbl = QLabel("In —  ·  Out —")
@@ -1816,11 +2233,17 @@ class MainWindow(QMainWindow):
         note_btn_row = QHBoxLayout()
         note_btn_row.addWidget(del_note_btn)
 
+        # whole-video note (applies to the entire video, not a frame)
+        self.video_note_edit = QLineEdit()
+        self.video_note_edit.setPlaceholderText("Whole-video note (applies to the entire video)…")
+        self.video_note_edit.editingFinished.connect(self._on_video_note_changed)
+
         # Pack into a "card"
         card_layout = QVBoxLayout()
         card_layout.addLayout(category_row)
         card_layout.addLayout(species_row)
         card_layout.addLayout(count_row)
+        card_layout.addLayout(sex_row)
         card_layout.addLayout(name_row)
         card_layout.addWidget(self.bbox_btn)
         card_layout.addWidget(QLabel("Annotated Features:"))
@@ -1830,6 +2253,8 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.notes_list)
         card_layout.addLayout(note_input_row)
         card_layout.addLayout(note_btn_row)
+        card_layout.addWidget(QLabel("Whole-video note:"))
+        card_layout.addWidget(self.video_note_edit)
         card_layout.addWidget(QLabel("Highlight clips (I / O to mark):"))
         card_layout.addWidget(self.clip_range_lbl)
         card_layout.addLayout(clip_mark_row)
@@ -1975,13 +2400,12 @@ class MainWindow(QMainWindow):
         _sc("Ctrl+I", self._mark_in)
         _sc("Ctrl+O", self._mark_out)
         _sc("F1", self._show_help)
-        # Delete only while the feature list is focused (so it can't eat text input)
-        wsc = (Qt.ShortcutContext.WidgetShortcut if _QT6 else Qt.WidgetShortcut)
-        for key in (Qt.Key.Key_Delete if _QT6 else Qt.Key_Delete,
-                    Qt.Key.Key_Backspace if _QT6 else Qt.Key_Backspace):
-            s = QShortcut(QKeySequence(key), self.feat_list)
-            s.setContext(wsc)
-            s.activated.connect(self._delete_feature)
+        _sc("Ctrl+S", self._save_json)
+        _sc("Ctrl+E", self._export_clip)
+        _sc("Ctrl+Right", lambda: self.seek_to(self.current_frame_idx + 10))
+        _sc("Ctrl+Left", lambda: self.seek_to(self.current_frame_idx - 10))
+        # Bare-key shortcuts (Space, B, C) and Delete are handled in
+        # keyPressEvent so they never hijack typing in a text field.
 
         # ---- assemble ----
         top = QHBoxLayout()
@@ -2001,6 +2425,7 @@ class MainWindow(QMainWindow):
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._sync_video_note()
         self._update_clip_label()
         self._update_zoom_label()
 
@@ -2026,6 +2451,14 @@ class MainWindow(QMainWindow):
         a_reveal = QAction("Open Local Annotations Folder", self)
         a_reveal.triggered.connect(self._open_local_annotations_folder)
         file_menu.addAction(a_reveal)
+
+        labels_menu = mb.addMenu("&Labels")
+        a_manage = QAction("Manage labels (add / remove / import CSV)…", self)
+        a_manage.triggered.connect(self._manage_labels)
+        labels_menu.addAction(a_manage)
+        a_reveal_cfg = QAction("Open Config Folder (CSV files)", self)
+        a_reveal_cfg.triggered.connect(self._open_config_folder)
+        labels_menu.addAction(a_reveal_cfg)
 
         help_menu = mb.addMenu("&Help")
         a_help = QAction("Keyboard & usage help", self)
@@ -2059,9 +2492,8 @@ class MainWindow(QMainWindow):
 
         species_category = self.category_combo.currentText() or "Other"
         species = self.species_combo.currentText().strip()
-        count = self.count_spin.value()
         confidence = self.confidence_combo.currentText().strip()
-        sex = self.sex_combo.currentText().strip()
+        count, sexes, sex = self._read_feature_counts()
         name = (self.name_edit.text() or "").strip()
         if not name:
             n = self._type_counters.get(species_category, 1)
@@ -2082,6 +2514,7 @@ class MainWindow(QMainWindow):
             species=species,
             confidence=confidence,
             sex=sex,
+            sexes=sexes,
         )
         self.store.add_feature(feat, {}, {fidx: (x1, y1, x2, y2)})
         self._selected_feature_idx = len(self.store.features) - 1
@@ -2097,8 +2530,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Added {species_category} ×{count} '{name}' on frame {fidx}."
             )
-        # clear name field so next annotation gets a fresh auto-name
+        # clear name + sex breakdown so the next animal starts fresh
         self.name_edit.clear()
+        for sp in (self.male_spin, self.female_spin, self.unknown_spin):
+            sp.setValue(0)
+        self.count_spin.setValue(1)
         # auto-disarm so the mode state is always explicit (arm → draw → off)
         self.bbox_btn.setChecked(False)
 
@@ -2222,6 +2658,100 @@ class MainWindow(QMainWindow):
             self.species_combo.setEditText(name)
         self.statusBar().showMessage(f"Added species '{name}' to {category}.")
 
+    def _add_habitat_dialog(self):
+        text, ok = QInputDialog.getText(self, "Add habitat", "New habitat:")
+        if not ok:
+            return
+        label = (text or "").strip()
+        if not label:
+            return
+        if label not in HABITAT_OPTIONS:
+            HABITAT_OPTIONS.append(label)
+            write_habitats_csv(HABITAT_OPTIONS)
+            self._habitat_append(label)
+            if hasattr(self, "timeline"):
+                i = len(HABITAT_OPTIONS) - 1
+                self.timeline._habitat_colors[label] = QColor(
+                    *FEATURE_COLORS[i % len(FEATURE_COLORS)])
+        if label in self._habitat_btns:
+            self._habitat_btns[label].setChecked(True)
+            self._on_habitat_selected(label)
+
+    def _manage_labels(self):
+        dlg = LabelManagerDialog(self)
+        if dlg.exec():
+            self._rebuild_label_bars()
+            self.statusBar().showMessage("Labels updated.")
+
+    def _rebuild_label_bars(self):
+        """Recreate the movement/social/habitat bars + species combos after the
+        label config changed (Manage labels / import / restore)."""
+        # remember current selections
+        cur = (self._current_movement, self._current_social, self._current_habitat)
+        for bar in (self.movement_bar, self.social_bar, self.habitat_bar):
+            self._video_col.removeWidget(bar)
+            bar.setParent(None)
+            bar.deleteLater()
+        self.movement_bar, self._movement_btns, self._movement_append = \
+            self._make_segment_bar("Movement:", MOVEMENT_OPTIONS,
+                                   self._on_movement_selected,
+                                   on_add=lambda: self._add_behavior_dialog("movement"))
+        self.social_bar, self._social_btns, self._social_append = \
+            self._make_segment_bar("Social:", SOCIAL_OPTIONS,
+                                   self._on_social_selected,
+                                   on_add=lambda: self._add_behavior_dialog("social"))
+        self.habitat_bar, self._habitat_btns, self._habitat_append = \
+            self._make_segment_bar("Habitat:", HABITAT_OPTIONS,
+                                   self._on_habitat_selected,
+                                   on_add=self._add_habitat_dialog)
+        self._video_col.insertWidget(1, self.movement_bar)
+        self._video_col.insertWidget(2, self.social_bar)
+        self._video_col.insertWidget(3, self.habitat_bar)
+        # keep valid current selections, else fall back to first option
+        self._current_movement = cur[0] if cur[0] in MOVEMENT_OPTIONS else MOVEMENT_OPTIONS[0]
+        self._current_social = cur[1] if cur[1] in SOCIAL_OPTIONS else SOCIAL_OPTIONS[0]
+        self._current_habitat = cur[2] if cur[2] in HABITAT_OPTIONS else HABITAT_OPTIONS[0]
+        for d, k in ((self._movement_btns, self._current_movement),
+                     (self._social_btns, self._current_social),
+                     (self._habitat_btns, self._current_habitat)):
+            if k in d:
+                d[k].setChecked(True)
+        # rebuild timeline colors + category/species combos
+        self._rebuild_timeline_colors()
+        self._rebuild_category_combo()
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+
+    def _rebuild_timeline_colors(self):
+        if not hasattr(self, "timeline"):
+            return
+        tl = self.timeline
+        pal = FEATURE_COLORS
+        tl._movement_colors = {opt: QColor(*pal[i % len(pal)])
+                               for i, opt in enumerate(MOVEMENT_OPTIONS)}
+        tl._movement_colors[None] = QColor(203, 213, 225)
+        tl._social_colors = {opt: QColor(*pal[(i + 3) % len(pal)])
+                             for i, opt in enumerate(SOCIAL_OPTIONS)}
+        tl._social_colors[None] = QColor(203, 213, 225)
+        known = {"Mangrove": QColor(16, 185, 129), "Rocky reef": QColor(14, 165, 233),
+                 "Sandy bottom": QColor(245, 158, 11), "Gravel": QColor(156, 163, 175),
+                 "Mud": QColor(120, 100, 80)}
+        tl._habitat_colors = {None: QColor(203, 213, 225)}
+        for i, h in enumerate(HABITAT_OPTIONS):
+            tl._habitat_colors[h] = known.get(h, QColor(*pal[i % len(pal)]))
+
+    def _rebuild_category_combo(self):
+        if not hasattr(self, "category_combo"):
+            return
+        cur = self.category_combo.currentText()
+        self.category_combo.blockSignals(True)
+        self.category_combo.clear()
+        self.category_combo.addItems(SPECIES_CATEGORY_ORDER)
+        i = self.category_combo.findText(cur)
+        self.category_combo.setCurrentIndex(i if i >= 0 else 0)
+        self.category_combo.blockSignals(False)
+        self._on_category_changed(self.category_combo.currentText())
+
     # -------------------------------------------------------------- notes
     def _refresh_notes(self):
         self.notes_list.clear()
@@ -2260,6 +2790,13 @@ class MainWindow(QMainWindow):
         note = item.data(user_role)
         if note is not None:
             self.seek_to(int(note["frame"]))
+
+    def _on_video_note_changed(self):
+        self.store.video_note = (self.video_note_edit.text() or "").strip()
+
+    def _sync_video_note(self):
+        if hasattr(self, "video_note_edit"):
+            self.video_note_edit.setText(self.store.video_note or "")
 
     def _on_category_changed(self, category: str):
         self.species_combo.clear()
@@ -2316,7 +2853,10 @@ class MainWindow(QMainWindow):
             if feat.species:
                 label = f"{feat.species_category}: {feat.species}"
             extra = ""
-            if feat.sex:
+            summary = feat.sex_summary()
+            if summary:
+                extra += f"  [{summary}]"
+            elif feat.sex:
                 extra += {"Male": " ♂", "Female": " ♀", "Unknown": " ?"}.get(feat.sex, "")
             if feat.confidence:
                 extra += f"  conf:{feat.confidence}"
@@ -2361,12 +2901,10 @@ class MainWindow(QMainWindow):
         self._update_edit_rect(self.current_frame_idx)
         feat = self.store.features[idx]
         self.name_edit.setText(feat.name)
-        self.count_spin.setValue(feat.count)
-        # Set confidence + sex combos
+        self._set_sex_inputs(feat)
+        # Set confidence combo
         ci = self.confidence_combo.findText(feat.confidence)
         self.confidence_combo.setCurrentIndex(ci if ci >= 0 else 0)
-        si = self.sex_combo.findText(feat.sex)
-        self.sex_combo.setCurrentIndex(si if si >= 0 else 0)
         # Set category combo
         cat_idx = self.category_combo.findText(feat.species_category)
         if cat_idx >= 0:
@@ -2394,9 +2932,8 @@ class MainWindow(QMainWindow):
             feat.name = name
         feat.species_category = self.category_combo.currentText()
         feat.species = self.species_combo.currentText().strip()
-        feat.count = self.count_spin.value()
         feat.confidence = self.confidence_combo.currentText().strip()
-        feat.sex = self.sex_combo.currentText().strip()
+        feat.count, feat.sexes, feat.sex = self._read_feature_counts()
         self._refresh_features()
         self._display_frame(self.current_frame_idx)
         if hasattr(self, "timeline"):
@@ -2546,16 +3083,47 @@ class MainWindow(QMainWindow):
         # keep the selected box's edit handles in sync with the view
         self._update_edit_rect(idx)
 
+    def _read_feature_counts(self):
+        """Reconcile the Count spin and the ♂/♀/? spinboxes into
+        (count, sexes_list, single_sex).  If any sex spinbox > 0 the breakdown
+        drives the count; otherwise Count is used with no per-animal sexes."""
+        m = self.male_spin.value()
+        f = self.female_spin.value()
+        u = self.unknown_spin.value()
+        total = m + f + u
+        if total > 0:
+            sexes = ["Male"] * m + ["Female"] * f + ["Unknown"] * u
+            return total, sexes, (sexes[0] if total == 1 else "")
+        return self.count_spin.value(), [], ""
+
+    def _set_sex_inputs(self, feat):
+        """Populate Count + ♂/♀/? spinboxes from a feature."""
+        self.count_spin.setValue(max(1, feat.count))
+        n = {"Male": 0, "Female": 0, "Unknown": 0}
+        if feat.sexes:
+            for s in feat.sexes:
+                if s in n:
+                    n[s] += 1
+        elif feat.sex in n:      # fold a legacy single sex into the breakdown
+            n[feat.sex] += 1
+        self.male_spin.setValue(n["Male"])
+        self.female_spin.setValue(n["Female"])
+        self.unknown_spin.setValue(n["Unknown"])
+
     @staticmethod
     def _feature_label(feat) -> str:
         """Compose the on-frame label for a feature (species, sex, count, conf)."""
         lbl = feat.species_category
         if feat.species:
             lbl = f"{feat.species_category}: {feat.species}"
-        sex_abbr = {"Male": "♂", "Female": "♀", "Unknown": "?"}.get(feat.sex, "")
-        if sex_abbr:
-            lbl = f"{lbl} {sex_abbr}"
-        if feat.count > 1:
+        summary = feat.sex_summary()
+        if summary:
+            lbl = f"{lbl} [{summary}]"
+        elif feat.sex:
+            sex_abbr = {"Male": "♂", "Female": "♀", "Unknown": "?"}.get(feat.sex, "")
+            if sex_abbr:
+                lbl = f"{lbl} {sex_abbr}"
+        if feat.count > 1 and not summary:
             lbl = f"{lbl} x{feat.count}"
         if feat.confidence:
             lbl = f"{lbl} ({feat.confidence[:1].lower()})"
@@ -2647,6 +3215,62 @@ class MainWindow(QMainWindow):
         self._display_frame(self.current_frame_idx)
         self.statusBar().showMessage(f"Resized box for '{feat.name}'.")
 
+    def _on_video_click(self, pos):
+        """Click on the video (not drawing/editing) → select the feature whose
+        box is under the cursor, so it can be edited or deleted."""
+        m = self._map(pos.x(), pos.y())
+        if m is None:
+            return
+        px, py = m
+        hit = None
+        for i, feat, mask, bbox in self.store.features_at(self.current_frame_idx):
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = bbox
+            if min(x1, x2) <= px <= max(x1, x2) and min(y1, y2) <= py <= max(y1, y2):
+                hit = i  # last (topmost) match wins
+        if hit is None:
+            return
+        # select it in the list (drives _selected_feature_idx + edit handles)
+        for row in range(self.feat_list.count()):
+            it = self.feat_list.item(row)
+            role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+            if it.data(role) == hit:
+                self.feat_list.setCurrentRow(row)
+                break
+
+    def _toggle_draw_shortcut(self):
+        self.bbox_btn.setChecked(not self.bbox_btn.isChecked())
+
+    def _focus_comment(self):
+        self.note_edit.setFocus()
+
+    def keyPressEvent(self, ev):
+        """Bare-key shortcuts + Delete, but only when a text field isn't focused
+        (so typing spaces/letters/backspace in a field is never hijacked)."""
+        fw = QApplication.focusWidget()
+        typing = isinstance(fw, (QLineEdit, QComboBox, QSpinBox))
+        key = ev.key()
+        K = Qt.Key if _QT6 else Qt
+
+        if not typing:
+            if key in ((K.Key_Delete, K.Key_Backspace)):
+                if self._selected_feature_idx is not None:
+                    self._delete_feature()
+                    ev.accept()
+                    return
+            elif key == K.Key_Space:
+                self.toggle_play(); ev.accept(); return
+            elif key == K.Key_B:
+                self._toggle_draw_shortcut(); ev.accept(); return
+            elif key == K.Key_C:
+                self._focus_comment(); ev.accept(); return
+            elif key == K.Key_I:
+                self._mark_in(); ev.accept(); return
+            elif key == K.Key_O:
+                self._mark_out(); ev.accept(); return
+        super().keyPressEvent(ev)
+
     def _zoom_at(self, factor, anchor_label=None):
         """Multiply zoom by `factor`, keeping the point under `anchor_label` fixed."""
         old = self._zoom
@@ -2706,6 +3330,7 @@ class MainWindow(QMainWindow):
             "next_color": s._next_color,
             "notes": copy.deepcopy(s.notes),
             "clips": copy.deepcopy(s.clips),
+            "video_note": s.video_note,
             "sel": self._selected_feature_idx,
         }
 
@@ -2730,10 +3355,12 @@ class MainWindow(QMainWindow):
         s._next_color = snap["next_color"]
         s.notes = snap["notes"]
         s.clips = snap["clips"]
+        s.video_note = snap.get("video_note", "")
         self._selected_feature_idx = snap["sel"]
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._sync_video_note()
         if hasattr(self, "timeline"):
             self.timeline.update()
         self._display_frame(self.current_frame_idx)
@@ -2958,9 +3585,12 @@ class MainWindow(QMainWindow):
         self.store.notes.sort(key=lambda nn: nn["frame"])
         for clip in loaded.clips:
             self.store.clips.append(clip)
+        if loaded.video_note and not self.store.video_note:
+            self.store.video_note = loaded.video_note
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._sync_video_note()
         if hasattr(self, "timeline"):
             self.timeline.update()
         self._display_frame(self.current_frame_idx)
@@ -3123,6 +3753,7 @@ class MainWindow(QMainWindow):
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._sync_video_note()
         self._update_clip_label()
         self._update_zoom_label()
         self.seek_to(0)
@@ -3195,9 +3826,11 @@ class MainWindow(QMainWindow):
             "Mud":          "#78644A",
         }
         VIS_COLORS = {
-            "Good":     "#22C55E",
-            "Moderate": "#F59E0B",
-            "Poor":     "#EF4444",
+            "Very bad":  "#BE123C",
+            "Bad":       "#EF4444",
+            "Fine":      "#F59E0B",
+            "Good":      "#22C55E",
+            "Very good": "#157F3D",
         }
         BEH_COLORS = [
             "#4F46E5", "#06B6D4", "#10B981", "#F59E0B", "#EF4444",
@@ -3887,19 +4520,23 @@ class MainWindow(QMainWindow):
         ws1 = wb.active
         ws1.title = "Sightings"
         _hrow(ws1, ["Frame", "Time", "Name", "Category", "Species",
-                    "Count", "Confidence", "Sex",
+                    "Count", "Males", "Females", "Unknown Sex", "Confidence",
                     "Movement", "Social", "Habitat", "Visibility"])
         ws1.freeze_panes = "A2"
         for r, feat in enumerate(
                 sorted(store.features, key=lambda f: f.init_frame), 2):
             fi = feat.init_frame
+            sx = feat.sexes or ([feat.sex] if feat.sex else [])
+            n_m = sum(1 for s in sx if s == "Male")
+            n_f = sum(1 for s in sx if s == "Female")
+            n_u = sum(1 for s in sx if s == "Unknown")
             for c, v in enumerate([
                 fi, _t(fi), feat.name,
                 feat.species_category or "",
                 feat.species or "",
                 feat.count,
+                n_m, n_f, n_u,
                 feat.confidence or "",
-                feat.sex or "",
                 mov_tl[fi] or "",
                 soc_tl[fi] or "",
                 hab_tl[fi] or "",
@@ -4007,13 +4644,20 @@ class MainWindow(QMainWindow):
 
         # ── Notes sheet ───────────────────────────────────────────
         wsn = wb.create_sheet("Notes")
-        _hrow(wsn, ["Frame", "Time", "Note"])
+        _hrow(wsn, ["Frame", "Time", "Comment"])
         wsn.freeze_panes = "A2"
-        for r, note in enumerate(sorted(store.notes, key=lambda n: n["frame"]), 2):
+        row = 2
+        if store.video_note:
+            wsn.cell(row=row, column=1, value="—")
+            wsn.cell(row=row, column=2, value="whole video")
+            wsn.cell(row=row, column=3, value=store.video_note)
+            row += 1
+        for note in sorted(store.notes, key=lambda n: n["frame"]):
             fi = int(note["frame"])
-            wsn.cell(row=r, column=1, value=fi)
-            wsn.cell(row=r, column=2, value=_t(fi))
-            wsn.cell(row=r, column=3, value=note.get("text", ""))
+            wsn.cell(row=row, column=1, value=fi)
+            wsn.cell(row=row, column=2, value=_t(fi))
+            wsn.cell(row=row, column=3, value=note.get("text", ""))
+            row += 1
         _autowidth(wsn)
 
         return wb
@@ -4065,43 +4709,56 @@ class MainWindow(QMainWindow):
 
         w.release()
 
-    def _open_local_annotations_folder(self):
+    @staticmethod
+    def _reveal_folder(path):
         try:
             from PyQt6.QtGui import QDesktopServices
             from PyQt6.QtCore import QUrl
         except ImportError:
             from PyQt5.QtGui import QDesktopServices
             from PyQt5.QtCore import QUrl
-        os.makedirs(LOCAL_ANNOTATIONS_DIR, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(LOCAL_ANNOTATIONS_DIR))
+        os.makedirs(path, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _open_local_annotations_folder(self):
+        self._reveal_folder(LOCAL_ANNOTATIONS_DIR)
+
+    def _open_config_folder(self):
+        self._reveal_folder(CONFIG_DIR)
 
     def _show_help(self):
         QMessageBox.information(
-            self, "CTAG Annotator — Help",
-            "Labeling\n"
-            "  • Movement + Social + Habitat + Visibility bars label the current\n"
-            "    frame; the label persists on later frames until you change it.\n"
-            "  • Mov/Soc/Hab/Vis checkboxes (bottom bar) choose WHICH axes are\n"
-            "    written while playing — untick the others to re-do just one\n"
-            "    (e.g. fix Sand → Gravel without touching behavior labels).\n"
-            "  • ＋ buttons add new behaviors / species (saved to ~/CTAG_Annotator).\n"
-            "  • Comments: add one at any frame ('ID this fish later'); rose\n"
-            "    markers show them on the timeline; double-click to jump back.\n\n"
-            "Bounding boxes\n"
-            "  • Draw Bbox → click TWO corners (right-click cancels).\n"
-            "  • Select a box in the list to drag its corners; Delete removes it.\n"
-            "  • Ctrl/⌘ + mouse-wheel (or +/- buttons) to zoom.\n\n"
-            "Highlight clips\n"
-            "  • Mark In / Mark Out (or Ctrl+I / Ctrl+O) set a range; Save Clip\n"
-            "    stores it; Export Clip writes an MP4 (optionally with overlays).\n\n"
-            "Other\n"
-            "  • ⌘Z / Ctrl+Z: undo.   ← / →: step frames.\n"
-            "  • Ctrl and +/- zoom.   Select a feature then Delete to remove it.\n"
-            "  • Work autosaves every 60 s to a LOCAL folder\n"
-            "    (~/CTAG_Annotator/annotations) — reliable even when the video\n"
-            "    is streamed from Google Drive/iCloud. You're prompted to resume\n"
-            "    on reopen. If a cloud save fails, a local copy is kept instead.\n"
-            "  • File menu: open other videos/folders, or reveal that folder.")
+            self, "CTAG Annotator — Shortcuts & help",
+            "KEYBOARD SHORTCUTS\n"
+            "  ←/→  step 1 frame      Ctrl+←/→  jump 10 frames\n"
+            "  Space  play/pause      B  arm Draw Bbox     C  focus Comment box\n"
+            "  I / O  mark clip In/Out    Delete  remove selected animal\n"
+            "  ⌘Z / Ctrl+Z  undo      Ctrl +/-  zoom in/out\n"
+            "  Ctrl+S  save JSON      Ctrl+E  export clip     F1  this help\n"
+            "  (letter keys are ignored while typing in a text box)\n\n"
+            "LABELING\n"
+            "  • Movement/Social/Habitat/Visibility bars label the current frame\n"
+            "    and persist until changed. The Mov/Soc/Hab/Vis checkboxes pick\n"
+            "    which axes are written — untick others to re-do just one (e.g.\n"
+            "    fix Sand → Gravel without touching behaviors).\n"
+            "  • ＋ on any bar adds a label; Labels menu ▸ Manage labels lets you\n"
+            "    add/remove, import a CSV, or restore defaults for behaviors,\n"
+            "    habitats and species.\n\n"
+            "ANIMALS / BOUNDING BOXES\n"
+            "  • Draw Bbox (or B), then click TWO corners (right-click cancels).\n"
+            "  • Click a box on the video to select it; drag its corners to edit;\n"
+            "    Delete removes it.\n"
+            "  • For sharks, set the ♂/♀/? counts to record each animal's sex.\n"
+            "  • Species dropdown includes family names — pick a family when you\n"
+            "    can't ID to species.\n\n"
+            "COMMENTS & CLIPS\n"
+            "  • Add a comment at any frame ('ID this fish later'); rose markers\n"
+            "    show them on the timeline. Plus a whole-video note field.\n"
+            "  • Mark In/Out → Save Clip → Export Clip (MP4, overlays optional).\n\n"
+            "SAVING\n"
+            "  • Autosaves every 60 s to ~/CTAG_Annotator/annotations (local, so\n"
+            "    it's reliable even when the video streams from Google Drive).\n"
+            "    You're prompted to resume on reopen.")
 
     # -------------------------------------------------------------- close
     def closeEvent(self, ev):
