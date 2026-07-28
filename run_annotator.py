@@ -830,31 +830,111 @@ QToolButton[segmented="true"] {
 }
 QToolButton[segmented="true"]:hover {
   background: #E2E8F0;
+  color: #0F172A;
 }
 QToolButton[segmented="true"]:checked {
   background: #4F46E5;
   border: 1px solid #4F46E5;
   color: #FFFFFF;
 }
+QToolButton[segmented="true"]:checked:hover {
+  background: #4338CA;
+  border: 1px solid #4338CA;
+  color: #FFFFFF;
+}
 
 QListWidget {
-  background: transparent;
-  border: none;
-}
-QListWidget::item {
   background: #FFFFFF;
   border: 1px solid #E5E7EB;
-  border-radius: 12px;
-  padding: 8px 10px;
-  margin: 4px 0px;
+  border-radius: 10px;
+}
+/* NOTE: no `color:` on items — the forced light palette supplies dark text,
+   and per-feature colored foregrounds (setForeground) must keep working. */
+QListWidget::item {
+  background: #FFFFFF;
+  border-bottom: 1px solid #F1F5F9;
+  padding: 5px 8px;
+}
+QListWidget::item:hover {
+  background: #F1F5F9;
 }
 QListWidget::item:selected {
-  background: #EEF2FF;
-  border: 1px solid #C7D2FE;
+  background: #DDE3FA;
+  border-bottom: 1px solid #C7D2FE;
 }
 
 QGroupBox { border: none; }
+
+/* Explicit styling for states that would otherwise inherit the OS dark-mode
+   palette (unreadable white-on-light text on some Macs). */
+QComboBox QAbstractItemView {
+  background: #FFFFFF;
+  color: #0F172A;
+  border: 1px solid #D1D5DB;
+  selection-background-color: #EEF2FF;
+  selection-color: #0F172A;
+  outline: none;
+}
+QSpinBox {
+  background: #FFFFFF;
+  border: 1px solid #D1D5DB;
+  border-radius: 8px;
+  padding: 3px 6px;
+  color: #0F172A;
+}
+QMenuBar { background: #F6F7FB; color: #0F172A; }
+QMenuBar::item { background: transparent; color: #0F172A; padding: 4px 10px; }
+QMenuBar::item:selected { background: #E2E8F0; color: #0F172A; border-radius: 6px; }
+QMenu { background: #FFFFFF; color: #0F172A; border: 1px solid #E5E7EB; }
+QMenu::item { padding: 5px 22px; color: #0F172A; }
+QMenu::item:selected { background: #EEF2FF; color: #0F172A; }
+QToolTip { background: #0F172A; color: #FFFFFF; border: none; padding: 5px 8px; }
+QScrollArea { background: transparent; border: none; }
+QScrollBar:vertical { background: #F1F5F9; width: 10px; border-radius: 5px; }
+QScrollBar::handle:vertical { background: #CBD5E1; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #94A3B8; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: #F1F5F9; height: 10px; border-radius: 5px; }
+QScrollBar::handle:horizontal { background: #CBD5E1; border-radius: 5px; min-width: 30px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QStatusBar { background: #F6F7FB; color: #475569; }
+QTabWidget::pane { border: 1px solid #E5E7EB; border-radius: 8px; background: #FFFFFF; }
+QTabBar::tab {
+  background: #F1F5F9; color: #0F172A; padding: 6px 14px;
+  border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px;
+}
+QTabBar::tab:selected { background: #4F46E5; color: #FFFFFF; }
+QTabBar::tab:hover:!selected { background: #E2E8F0; color: #0F172A; }
 """
+
+
+def _apply_light_palette(app):
+    """Force a light palette so the app looks identical on dark-mode Macs.
+
+    Without this, un-styled widget states (hovers, popups, selections) inherit
+    the OS dark palette while our QSS paints light backgrounds — producing
+    light-on-light (unreadable) text.
+    """
+    try:
+        from PyQt6.QtGui import QPalette
+        CR = QPalette.ColorRole
+    except ImportError:
+        from PyQt5.QtGui import QPalette
+        CR = QPalette
+    pal = QPalette()
+    pal.setColor(CR.Window, QColor("#F6F7FB"))
+    pal.setColor(CR.WindowText, QColor("#0F172A"))
+    pal.setColor(CR.Base, QColor("#FFFFFF"))
+    pal.setColor(CR.AlternateBase, QColor("#F1F5F9"))
+    pal.setColor(CR.Text, QColor("#0F172A"))
+    pal.setColor(CR.Button, QColor("#F1F5F9"))
+    pal.setColor(CR.ButtonText, QColor("#0F172A"))
+    pal.setColor(CR.Highlight, QColor("#C7D2FE"))
+    pal.setColor(CR.HighlightedText, QColor("#0F172A"))
+    pal.setColor(CR.ToolTipBase, QColor("#0F172A"))
+    pal.setColor(CR.ToolTipText, QColor("#FFFFFF"))
+    pal.setColor(CR.PlaceholderText, QColor("#94A3B8"))
+    app.setPalette(pal)
 
 # --------------------------------------------------------------------------
 # Data model
@@ -1642,11 +1722,16 @@ class AnnotationTimeline(QWidget):
         end_w = p.fontMetrics().horizontalAdvance(end_t)
         p.drawText(x0 + w - end_w, scrub_y + row_h + 16, end_t)
 
-        # current time above knob
+        # current time beside the knob, inside the scrub row (bold)
         p.setPen(QColor(15, 23, 42))
+        fb = p.font(); fb.setBold(True); p.setFont(fb)
         cur_w = p.fontMetrics().horizontalAdvance(cur_t)
-        tx = max(x0, min(cx - cur_w // 2, x0 + w - cur_w))
-        p.drawText(tx, scrub_y - 5, cur_t)
+        ty = mid_y + p.fontMetrics().ascent() // 2 - 1
+        if cx + 14 + cur_w <= x0 + w - 4:
+            p.drawText(cx + 14, ty, cur_t)      # right of knob
+        else:
+            p.drawText(cx - 14 - cur_w, ty, cur_t)  # left of knob near the end
+        fb.setBold(False); p.setFont(fb)
 
 
 # --------------------------------------------------------------------------
@@ -1950,9 +2035,11 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.seek_to(0)
-        # Offer to resume a prior autosave for this source (unless preloaded)
+        # Offer to resume a prior autosave for this source (unless preloaded).
+        # Deferred so the main window is visible first — a modal dialog during
+        # __init__ would block startup with the window not yet on screen.
         if preloaded_store is None:
-            self._maybe_resume_autosave()
+            QTimer.singleShot(400, self._maybe_resume_autosave)
 
     # ------------------------------------------------------------------ UI
     def _make_segment_bar(self, title: str, options: List[str], on_select,
@@ -2072,8 +2159,20 @@ class MainWindow(QMainWindow):
 
         # -------------------------------- right panel (feature list — read-only)
         # feature list (populated from JSON if available; cannot add without tracking)
-        self.feat_list = QListWidget()
+        def _tidy_list(lw):
+            """Elide long rows instead of growing a horizontal scrollbar."""
+            try:
+                lw.setTextElideMode(Qt.TextElideMode.ElideRight)
+                lw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            except AttributeError:
+                lw.setTextElideMode(Qt.ElideRight)
+                lw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            lw.setWordWrap(False)
+            return lw
+
+        self.feat_list = _tidy_list(QListWidget())
         self.feat_list.currentItemChanged.connect(self._on_feature_selected)
+        self._tidy_list = _tidy_list
 
         fa = QHBoxLayout()
         del_btn = QPushButton("Delete")
@@ -2108,9 +2207,20 @@ class MainWindow(QMainWindow):
         load_json_btn.setObjectName("Secondary")
         load_json_btn.clicked.connect(self._load_json)
 
+        # Combos must be allowed to shrink below their content width, otherwise
+        # the whole right panel gets forced wider than its container and clips.
+        def _shrinkable(combo, chars=10):
+            try:
+                combo.setSizeAdjustPolicy(
+                    QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            except AttributeError:
+                combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(chars)
+            return combo
+
         # Category combo (derived from the loaded species config)
         first_cat = SPECIES_CATEGORY_ORDER[0] if SPECIES_CATEGORY_ORDER else "Shark"
-        self.category_combo = QComboBox()
+        self.category_combo = _shrinkable(QComboBox())
         self.category_combo.addItems(SPECIES_CATEGORY_ORDER)
 
         category_row = QHBoxLayout()
@@ -2118,7 +2228,7 @@ class MainWindow(QMainWindow):
         category_row.addWidget(self.category_combo, stretch=1)
 
         # Species combo (editable with autocomplete) + "add species" button
-        self.species_combo = QComboBox()
+        self.species_combo = _shrinkable(QComboBox(), chars=14)
         self.species_combo.setEditable(True)
         self.species_combo.addItem("")
         self.species_combo.addItems(SPECIES_CATEGORIES.get(first_cat, []))
@@ -2148,10 +2258,12 @@ class MainWindow(QMainWindow):
         self.count_spin.setMinimum(1)
         self.count_spin.setMaximum(9999)
         self.count_spin.setValue(1)
-        self.confidence_combo = QComboBox()
+        self.count_spin.setMinimumWidth(52)
+        self.confidence_combo = _shrinkable(QComboBox(), chars=6)
         self.confidence_combo.addItems(CONFIDENCE_OPTIONS)
 
         count_row = QHBoxLayout()
+        count_row.setSpacing(6)
         count_row.addWidget(QLabel("Count:"))
         count_row.addWidget(self.count_spin, stretch=1)
         count_row.addWidget(QLabel("Conf:"))
@@ -2159,12 +2271,14 @@ class MainWindow(QMainWindow):
 
         # Per-individual sex breakdown (mainly for sharks): how many ♂ / ♀ / ?
         # When any of these is > 0 it overrides Count and records each animal's sex.
-        self.male_spin = QSpinBox(); self.male_spin.setRange(0, 9999)
-        self.female_spin = QSpinBox(); self.female_spin.setRange(0, 9999)
-        self.unknown_spin = QSpinBox(); self.unknown_spin.setRange(0, 9999)
+        self.male_spin = QSpinBox(); self.male_spin.setRange(0, 999)
+        self.female_spin = QSpinBox(); self.female_spin.setRange(0, 999)
+        self.unknown_spin = QSpinBox(); self.unknown_spin.setRange(0, 999)
         for sp in (self.male_spin, self.female_spin, self.unknown_spin):
             sp.setToolTip("Number of sharks of this sex in the interaction")
+            sp.setMinimumWidth(40)
         sex_row = QHBoxLayout()
+        sex_row.setSpacing(4)
         sex_lbl = QLabel("Sex:")
         sex_lbl.setToolTip("Record the sex of each shark — set ♂ / ♀ / unknown counts")
         sex_row.addWidget(sex_lbl)
@@ -2199,7 +2313,7 @@ class MainWindow(QMainWindow):
         clip_mark_row.addWidget(mark_in_btn)
         clip_mark_row.addWidget(mark_out_btn)
 
-        self.clips_list = QListWidget()
+        self.clips_list = _tidy_list(QListWidget())
         self.clips_list.setMaximumHeight(100)
         self.clips_list.itemDoubleClicked.connect(self._on_clip_activated)
         save_clip_btn = QPushButton("Save Clip")
@@ -2215,7 +2329,7 @@ class MainWindow(QMainWindow):
         clip_btn_row.addWidget(del_clip_btn)
 
         # ---- Timestamped comments ----
-        self.notes_list = QListWidget()
+        self.notes_list = _tidy_list(QListWidget())
         self.notes_list.setMaximumHeight(140)
         self.notes_list.itemDoubleClicked.connect(self._on_note_activated)
         self.note_edit = QLineEdit()
@@ -2270,8 +2384,8 @@ class MainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("Card")
         card_v = QVBoxLayout()
-        card_v.setContentsMargins(14, 14, 14, 14)
-        card_v.setSpacing(10)
+        card_v.setContentsMargins(12, 12, 12, 12)
+        card_v.setSpacing(8)
         title = QLabel("Controls")
         title.setObjectName("Title")
         subtitle = QLabel("Label movement, social, habitat & visibility. "
@@ -2290,8 +2404,8 @@ class MainWindow(QMainWindow):
         hbar_off = (Qt.ScrollBarPolicy.ScrollBarAlwaysOff if _QT6
                     else Qt.ScrollBarAlwaysOff)
         rw.setHorizontalScrollBarPolicy(hbar_off)
-        rw.setMaximumWidth(372)
-        rw.setMinimumWidth(340)
+        rw.setMaximumWidth(400)
+        rw.setMinimumWidth(360)
 
         # ---- playback controls ----
         self.play_btn = QPushButton("Play")
@@ -2758,6 +2872,7 @@ class MainWindow(QMainWindow):
         for note in self.store.notes:
             t = self.timeline._format_time(note["frame"] / max(1e-6, self.fps))
             it = QListWidgetItem(f"[{t}]  {note['text']}")
+            it.setToolTip(note["text"])
             user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
             it.setData(user_role, note)
             self.notes_list.addItem(it)
@@ -2862,6 +2977,7 @@ class MainWindow(QMainWindow):
                 extra += f"  conf:{feat.confidence}"
             display = f"{label}{extra}  ×{feat.count}  [f{feat.init_frame}]  {feat.name}"
             it = QListWidgetItem(display)
+            it.setToolTip(display)   # full text on hover (rows elide when narrow)
             user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
             it.setData(user_role, i)
             it.setForeground(QColor(*c))
@@ -4920,6 +5036,7 @@ def main():
         app.setStyle("Fusion")
     except Exception:
         pass
+    _apply_light_palette(app)
     app.setStyleSheet(APP_QSS)
 
     f = QFont()
