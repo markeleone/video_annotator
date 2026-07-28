@@ -38,8 +38,9 @@ import numpy as np
 # Qt compatibility: prefer PyQt6, fall back to PyQt5
 # --------------------------------------------------------------------------
 try:
-    from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
-    from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont, QShortcut, QKeySequence
+    from PyQt6.QtCore import Qt, QTimer, QSize, QPoint, pyqtSignal
+    from PyQt6.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QFont,
+                             QShortcut, QKeySequence, QPolygon)
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QLabel, QPushButton, QHBoxLayout,
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
@@ -49,8 +50,9 @@ try:
     )
     _QT6 = True
 except ImportError:
-    from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal
-    from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont, QShortcut, QKeySequence
+    from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, pyqtSignal
+    from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QFont,
+                             QShortcut, QKeySequence, QPolygon)
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QLabel, QPushButton, QHBoxLayout,
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
@@ -1008,6 +1010,10 @@ class FeatureStore:
         # a single free-text note for the whole video
         self.video_note: str = ""
 
+        # conspecific shark encounters logged from the Social bar:
+        # [{"frame": int, "males": int, "females": int, "unknown": int}]
+        self.shark_log: List[Dict] = []
+
         # saved highlight clips: list of {"name": str, "start": int, "end": int}
         self.clips: List[Dict] = []
 
@@ -1096,6 +1102,7 @@ class FeatureStore:
             },
             "notes": [dict(n) for n in self.notes],
             "video_note": self.video_note,
+            "shark_log": [dict(e) for e in self.shark_log],
             "clips": [dict(c) for c in self.clips],
             "features": [],
         }
@@ -1159,6 +1166,18 @@ class FeatureStore:
                 continue
         store.notes.sort(key=lambda n: n["frame"])
         store.video_note = str(data.get("video_note", "") or "")
+
+        for ed in data.get("shark_log", []):
+            try:
+                store.shark_log.append({
+                    "frame": int(ed["frame"]),
+                    "males": int(ed.get("males", 0)),
+                    "females": int(ed.get("females", 0)),
+                    "unknown": int(ed.get("unknown", 0)),
+                })
+            except (KeyError, ValueError, TypeError):
+                continue
+        store.shark_log.sort(key=lambda e: e["frame"])
 
         for cd in data.get("clips", []):
             try:
@@ -1591,6 +1610,20 @@ class AnnotationTimeline(QWidget):
         draw_left_label("Social", social_y)
         social_labels = self.store.social_per_frame if self.store is not None else None
         draw_segment_row(social_y, social_labels, self._social_colors)
+
+        # shark-log markers on the social row: dark diamond + total count
+        if self.store is not None and getattr(self.store, "shark_log", None):
+            for e in self.store.shark_log:
+                ex = int(x0 + (e["frame"] / max(1, self.total_frames)) * w)
+                cy = social_y + row_h // 2
+                p.setPen(QPen(QColor(255, 255, 255), 1))
+                p.setBrush(QColor(15, 23, 42))
+                pts = [(ex, cy - 5), (ex + 5, cy), (ex, cy + 5), (ex - 5, cy)]
+                p.drawPolygon(QPolygon([QPoint(a, b) for a, b in pts]))
+                total = e.get("males", 0) + e.get("females", 0) + e.get("unknown", 0)
+                ff = p.font(); ff.setPointSize(9); ff.setBold(True); p.setFont(ff)
+                p.setPen(QColor(15, 23, 42))
+                p.drawText(ex + 7, cy + 4, str(total))
 
         # --- Habitat row
         draw_left_label("Habitat", habitat_y)
@@ -2138,6 +2171,10 @@ class MainWindow(QMainWindow):
         self.visibility_bar, self._visibility_btns, _ = self._make_segment_bar(
             "Visibility:", VISIBILITY_OPTIONS, self._on_visibility_selected
         )
+        # Conspecific shark logger lives ON the social bar (sharks are a social
+        # observation, not a fish-ID annotation)
+        self._shark_logger = self._make_shark_logger()
+        self.social_bar.layout().addWidget(self._shark_logger)
         # initial highlight
         self._movement_btns[self._current_movement].setChecked(True)
         self._social_btns[self._current_social].setChecked(True)
@@ -2253,7 +2290,8 @@ class MainWindow(QMainWindow):
         species_row.addWidget(self.species_combo, stretch=1)
         species_row.addWidget(self.add_species_btn)
 
-        # Count spinbox + confidence
+        # Count spinbox + confidence.  (No sex fields here — conspecific sharks
+        # are logged on the Social bar, not as fish-ID annotations.)
         self.count_spin = QSpinBox()
         self.count_spin.setMinimum(1)
         self.count_spin.setMaximum(9999)
@@ -2268,23 +2306,6 @@ class MainWindow(QMainWindow):
         count_row.addWidget(self.count_spin, stretch=1)
         count_row.addWidget(QLabel("Conf:"))
         count_row.addWidget(self.confidence_combo, stretch=1)
-
-        # Per-individual sex breakdown (mainly for sharks): how many ♂ / ♀ / ?
-        # When any of these is > 0 it overrides Count and records each animal's sex.
-        self.male_spin = QSpinBox(); self.male_spin.setRange(0, 999)
-        self.female_spin = QSpinBox(); self.female_spin.setRange(0, 999)
-        self.unknown_spin = QSpinBox(); self.unknown_spin.setRange(0, 999)
-        for sp in (self.male_spin, self.female_spin, self.unknown_spin):
-            sp.setToolTip("Number of sharks of this sex in the interaction")
-            sp.setMinimumWidth(40)
-        sex_row = QHBoxLayout()
-        sex_row.setSpacing(4)
-        sex_lbl = QLabel("Sex:")
-        sex_lbl.setToolTip("Record the sex of each shark — set ♂ / ♀ / unknown counts")
-        sex_row.addWidget(sex_lbl)
-        sex_row.addWidget(QLabel("♂")); sex_row.addWidget(self.male_spin, stretch=1)
-        sex_row.addWidget(QLabel("♀")); sex_row.addWidget(self.female_spin, stretch=1)
-        sex_row.addWidget(QLabel("?")); sex_row.addWidget(self.unknown_spin, stretch=1)
 
         # Draw bbox toggle button
         self.bbox_btn = QPushButton("Draw Bbox")
@@ -2328,6 +2349,14 @@ class MainWindow(QMainWindow):
         clip_btn_row.addWidget(save_clip_btn)
         clip_btn_row.addWidget(del_clip_btn)
 
+        # ---- Conspecific shark log (fed by the Social bar's ♂/♀/?+Log) ----
+        self.shark_log_list = _tidy_list(QListWidget())
+        self.shark_log_list.setMaximumHeight(88)
+        self.shark_log_list.itemDoubleClicked.connect(self._on_shark_entry_activated)
+        del_shark_btn = QPushButton("Delete Entry")
+        del_shark_btn.setObjectName("Secondary")
+        del_shark_btn.clicked.connect(self._delete_shark_entry)
+
         # ---- Timestamped comments ----
         self.notes_list = _tidy_list(QListWidget())
         self.notes_list.setMaximumHeight(140)
@@ -2357,12 +2386,14 @@ class MainWindow(QMainWindow):
         card_layout.addLayout(category_row)
         card_layout.addLayout(species_row)
         card_layout.addLayout(count_row)
-        card_layout.addLayout(sex_row)
         card_layout.addLayout(name_row)
         card_layout.addWidget(self.bbox_btn)
         card_layout.addWidget(QLabel("Annotated Features:"))
         card_layout.addWidget(self.feat_list, stretch=1)
         card_layout.addLayout(fa)
+        card_layout.addWidget(QLabel("Shark log (from Social bar, double-click to jump):"))
+        card_layout.addWidget(self.shark_log_list)
+        card_layout.addWidget(del_shark_btn)
         card_layout.addWidget(QLabel("Comments (double-click to jump):"))
         card_layout.addWidget(self.notes_list)
         card_layout.addLayout(note_input_row)
@@ -2539,6 +2570,7 @@ class MainWindow(QMainWindow):
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._refresh_shark_log()
         self._sync_video_note()
         self._update_clip_label()
         self._update_zoom_label()
@@ -2607,7 +2639,7 @@ class MainWindow(QMainWindow):
         species_category = self.category_combo.currentText() or "Other"
         species = self.species_combo.currentText().strip()
         confidence = self.confidence_combo.currentText().strip()
-        count, sexes, sex = self._read_feature_counts()
+        count = self.count_spin.value()
         name = (self.name_edit.text() or "").strip()
         if not name:
             n = self._type_counters.get(species_category, 1)
@@ -2627,8 +2659,6 @@ class MainWindow(QMainWindow):
             species_category=species_category,
             species=species,
             confidence=confidence,
-            sex=sex,
-            sexes=sexes,
         )
         self.store.add_feature(feat, {}, {fidx: (x1, y1, x2, y2)})
         self._selected_feature_idx = len(self.store.features) - 1
@@ -2644,10 +2674,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Added {species_category} ×{count} '{name}' on frame {fidx}."
             )
-        # clear name + sex breakdown so the next animal starts fresh
+        # clear name + count so the next animal starts fresh
         self.name_edit.clear()
-        for sp in (self.male_spin, self.female_spin, self.unknown_spin):
-            sp.setValue(0)
         self.count_spin.setValue(1)
         # auto-disarm so the mode state is always explicit (arm → draw → off)
         self.bbox_btn.setChecked(False)
@@ -2802,6 +2830,8 @@ class MainWindow(QMainWindow):
         label config changed (Manage labels / import / restore)."""
         # remember current selections
         cur = (self._current_movement, self._current_social, self._current_habitat)
+        # detach the shark logger so deleting the old social bar can't kill it
+        self._shark_logger.setParent(None)
         for bar in (self.movement_bar, self.social_bar, self.habitat_bar):
             self._video_col.removeWidget(bar)
             bar.setParent(None)
@@ -2818,6 +2848,7 @@ class MainWindow(QMainWindow):
             self._make_segment_bar("Habitat:", HABITAT_OPTIONS,
                                    self._on_habitat_selected,
                                    on_add=self._add_habitat_dialog)
+        self.social_bar.layout().addWidget(self._shark_logger)  # re-attach
         self._video_col.insertWidget(1, self.movement_bar)
         self._video_col.insertWidget(2, self.social_bar)
         self._video_col.insertWidget(3, self.habitat_bar)
@@ -2865,6 +2896,105 @@ class MainWindow(QMainWindow):
         self.category_combo.setCurrentIndex(i if i >= 0 else 0)
         self.category_combo.blockSignals(False)
         self._on_category_changed(self.category_combo.currentText())
+
+    # ------------------------------------------------- conspecific sharks
+    def _make_shark_logger(self):
+        """Compact ♂/♀/? + Log control shown at the end of the Social bar."""
+        w = QWidget()
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(12, 0, 0, 0)
+        hl.setSpacing(4)
+        lab = QLabel("Sharks:")
+        lab.setObjectName("BarTitle")
+        lab.setToolTip("Log the conspecific sharks present right now:\n"
+                       "set ♂ / ♀ / ? counts, then press Log.\n"
+                       "Log again whenever the group changes.")
+        hl.addWidget(lab)
+        self.shark_m_spin = QSpinBox(); self.shark_f_spin = QSpinBox()
+        self.shark_u_spin = QSpinBox()
+        for sp, sym in ((self.shark_m_spin, "♂"), (self.shark_f_spin, "♀"),
+                        (self.shark_u_spin, "?")):
+            sp.setRange(0, 99)
+            sp.setToolTip(f"Number of {sym} sharks present")
+            hl.addWidget(QLabel(sym))
+            hl.addWidget(sp)
+        log_btn = QToolButton()
+        log_btn.setText("Log")
+        log_btn.setProperty("segmented", True)
+        log_btn.setToolTip("Record this shark group at the current frame")
+        log_btn.clicked.connect(self._log_sharks)
+        hl.addWidget(log_btn)
+        return w
+
+    @staticmethod
+    def _shark_entry_text(e) -> str:
+        parts = []
+        if e.get("males"):
+            parts.append(f"{e['males']}♂")
+        if e.get("females"):
+            parts.append(f"{e['females']}♀")
+        if e.get("unknown"):
+            parts.append(f"{e['unknown']}?")
+        total = e.get("males", 0) + e.get("females", 0) + e.get("unknown", 0)
+        return f"{' '.join(parts) or '0'}  ({total} shark{'s' if total != 1 else ''})"
+
+    def _log_sharks(self):
+        m = self.shark_m_spin.value()
+        f = self.shark_f_spin.value()
+        u = self.shark_u_spin.value()
+        if m + f + u == 0:
+            self.statusBar().showMessage(
+                "Set the ♂/♀/? counts first, then press Log.")
+            return
+        self._push_undo()
+        fi = self.current_frame_idx
+        # replace an existing entry on the same frame instead of duplicating
+        self.store.shark_log = [e for e in self.store.shark_log
+                                if e["frame"] != fi]
+        entry = {"frame": fi, "males": m, "females": f, "unknown": u}
+        self.store.shark_log.append(entry)
+        self.store.shark_log.sort(key=lambda e: e["frame"])
+        self._refresh_shark_log()
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+        for sp in (self.shark_m_spin, self.shark_f_spin, self.shark_u_spin):
+            sp.setValue(0)
+        self.statusBar().showMessage(
+            f"Logged sharks at frame {fi}: {self._shark_entry_text(entry)}")
+
+    def _refresh_shark_log(self):
+        if not hasattr(self, "shark_log_list"):
+            return
+        self.shark_log_list.clear()
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        for e in self.store.shark_log:
+            t = self.timeline._format_time(e["frame"] / max(1e-6, self.fps))
+            it = QListWidgetItem(f"[{t}]  {self._shark_entry_text(e)}")
+            it.setToolTip("Double-click to jump; select + Delete Entry to remove")
+            it.setData(user_role, e)
+            self.shark_log_list.addItem(it)
+
+    def _delete_shark_entry(self):
+        it = self.shark_log_list.currentItem()
+        if it is None:
+            return
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        e = it.data(user_role)
+        if e is not None:
+            self._push_undo()
+            try:
+                self.store.shark_log.remove(e)
+            except ValueError:
+                pass
+            self._refresh_shark_log()
+            if hasattr(self, "timeline"):
+                self.timeline.update()
+
+    def _on_shark_entry_activated(self, item):
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        e = item.data(user_role)
+        if e is not None:
+            self.seek_to(int(e["frame"]))
 
     # -------------------------------------------------------------- notes
     def _refresh_notes(self):
@@ -3017,7 +3147,7 @@ class MainWindow(QMainWindow):
         self._update_edit_rect(self.current_frame_idx)
         feat = self.store.features[idx]
         self.name_edit.setText(feat.name)
-        self._set_sex_inputs(feat)
+        self.count_spin.setValue(max(1, feat.count))
         # Set confidence combo
         ci = self.confidence_combo.findText(feat.confidence)
         self.confidence_combo.setCurrentIndex(ci if ci >= 0 else 0)
@@ -3049,7 +3179,7 @@ class MainWindow(QMainWindow):
         feat.species_category = self.category_combo.currentText()
         feat.species = self.species_combo.currentText().strip()
         feat.confidence = self.confidence_combo.currentText().strip()
-        feat.count, feat.sexes, feat.sex = self._read_feature_counts()
+        feat.count = self.count_spin.value()
         self._refresh_features()
         self._display_frame(self.current_frame_idx)
         if hasattr(self, "timeline"):
@@ -3198,33 +3328,6 @@ class MainWindow(QMainWindow):
 
         # keep the selected box's edit handles in sync with the view
         self._update_edit_rect(idx)
-
-    def _read_feature_counts(self):
-        """Reconcile the Count spin and the ♂/♀/? spinboxes into
-        (count, sexes_list, single_sex).  If any sex spinbox > 0 the breakdown
-        drives the count; otherwise Count is used with no per-animal sexes."""
-        m = self.male_spin.value()
-        f = self.female_spin.value()
-        u = self.unknown_spin.value()
-        total = m + f + u
-        if total > 0:
-            sexes = ["Male"] * m + ["Female"] * f + ["Unknown"] * u
-            return total, sexes, (sexes[0] if total == 1 else "")
-        return self.count_spin.value(), [], ""
-
-    def _set_sex_inputs(self, feat):
-        """Populate Count + ♂/♀/? spinboxes from a feature."""
-        self.count_spin.setValue(max(1, feat.count))
-        n = {"Male": 0, "Female": 0, "Unknown": 0}
-        if feat.sexes:
-            for s in feat.sexes:
-                if s in n:
-                    n[s] += 1
-        elif feat.sex in n:      # fold a legacy single sex into the breakdown
-            n[feat.sex] += 1
-        self.male_spin.setValue(n["Male"])
-        self.female_spin.setValue(n["Female"])
-        self.unknown_spin.setValue(n["Unknown"])
 
     @staticmethod
     def _feature_label(feat) -> str:
@@ -3447,6 +3550,7 @@ class MainWindow(QMainWindow):
             "notes": copy.deepcopy(s.notes),
             "clips": copy.deepcopy(s.clips),
             "video_note": s.video_note,
+            "shark_log": copy.deepcopy(s.shark_log),
             "sel": self._selected_feature_idx,
         }
 
@@ -3472,10 +3576,12 @@ class MainWindow(QMainWindow):
         s.notes = snap["notes"]
         s.clips = snap["clips"]
         s.video_note = snap.get("video_note", "")
+        s.shark_log = snap.get("shark_log", [])
         self._selected_feature_idx = snap["sel"]
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._refresh_shark_log()
         self._sync_video_note()
         if hasattr(self, "timeline"):
             self.timeline.update()
@@ -3701,11 +3807,15 @@ class MainWindow(QMainWindow):
         self.store.notes.sort(key=lambda nn: nn["frame"])
         for clip in loaded.clips:
             self.store.clips.append(clip)
+        for e in loaded.shark_log:
+            self.store.shark_log.append(e)
+        self.store.shark_log.sort(key=lambda e: e["frame"])
         if loaded.video_note and not self.store.video_note:
             self.store.video_note = loaded.video_note
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._refresh_shark_log()
         self._sync_video_note()
         if hasattr(self, "timeline"):
             self.timeline.update()
@@ -3869,6 +3979,7 @@ class MainWindow(QMainWindow):
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
+        self._refresh_shark_log()
         self._sync_video_note()
         self._update_clip_label()
         self._update_zoom_label()
@@ -4776,6 +4887,27 @@ class MainWindow(QMainWindow):
             row += 1
         _autowidth(wsn)
 
+        # ── Shark Log sheet (conspecifics logged from the Social bar) ─
+        wss = wb.create_sheet("Shark Log")
+        _hrow(wss, ["Frame", "Time", "Males", "Females", "Unknown", "Total",
+                    "Social", "Movement", "Habitat", "Visibility"])
+        wss.freeze_panes = "A2"
+        for r, e in enumerate(sorted(store.shark_log,
+                                     key=lambda x: x["frame"]), 2):
+            fi = int(e["frame"])
+            total = e.get("males", 0) + e.get("females", 0) + e.get("unknown", 0)
+            for c, v in enumerate([
+                fi, _t(fi),
+                e.get("males", 0), e.get("females", 0), e.get("unknown", 0),
+                total,
+                soc_tl[fi] or "" if fi < len(soc_tl) else "",
+                mov_tl[fi] or "" if fi < len(mov_tl) else "",
+                hab_tl[fi] or "" if fi < len(hab_tl) else "",
+                vis_tl[fi] or "" if fi < len(vis_tl) else "",
+            ], 1):
+                wss.cell(row=r, column=c, value=v)
+        _autowidth(wss)
+
         return wb
 
     @staticmethod
@@ -4860,11 +4992,16 @@ class MainWindow(QMainWindow):
             "  • ＋ on any bar adds a label; Labels menu ▸ Manage labels lets you\n"
             "    add/remove, import a CSV, or restore defaults for behaviors,\n"
             "    habitats and species.\n\n"
-            "ANIMALS / BOUNDING BOXES\n"
+            "CONSPECIFIC SHARKS (Social bar)\n"
+            "  • Other sharks are a social observation, not a fish-ID box: on the\n"
+            "    Social bar set the ♂/♀/? counts and press Log to record the\n"
+            "    group at the current frame. Log again whenever it changes.\n"
+            "  • Entries show as ◆ markers on the Social timeline row and in the\n"
+            "    Shark log list (double-click to jump; Delete Entry removes).\n\n"
+            "OTHER ANIMALS / BOUNDING BOXES\n"
             "  • Draw Bbox (or B), then click TWO corners (right-click cancels).\n"
             "  • Click a box on the video to select it; drag its corners to edit;\n"
             "    Delete removes it.\n"
-            "  • For sharks, set the ♂/♀/? counts to record each animal's sex.\n"
             "  • Species dropdown includes family names — pick a family when you\n"
             "    can't ID to species.\n\n"
             "COMMENTS & CLIPS\n"
