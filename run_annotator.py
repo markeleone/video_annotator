@@ -1058,6 +1058,24 @@ class FeatureStore:
         if 0 <= frame_idx < self.total_frames:
             self.visibility_per_frame[frame_idx] = label
 
+    def social_segment_at(self, frame: int):
+        """(start, end, label) of the contiguous social-label run containing
+        `frame`.  Shark-log entries apply to this whole span — e.g. a group of
+        5 sharks logged during a "Brief interaction" covers the entire
+        interaction, not just one moment.  Unlabeled frame → single-frame span.
+        """
+        frame = max(0, min(int(frame), self.total_frames - 1))
+        lab = self.social_per_frame[frame]
+        if lab is None:
+            return frame, frame, None
+        s = frame
+        while s > 0 and self.social_per_frame[s - 1] == lab:
+            s -= 1
+        e = frame
+        while e < self.total_frames - 1 and self.social_per_frame[e + 1] == lab:
+            e += 1
+        return s, e, lab
+
     def add_note(self, frame_idx: int, text: str):
         text = (text or "").strip()
         if not text:
@@ -1102,7 +1120,13 @@ class FeatureStore:
             },
             "notes": [dict(n) for n in self.notes],
             "video_note": self.video_note,
-            "shark_log": [dict(e) for e in self.shark_log],
+            # each entry carries its derived social-segment span so analysts
+            # get the full interaction window without re-deriving it
+            "shark_log": [
+                {**e, "start": seg[0], "end": seg[1], "social": seg[2]}
+                for e in self.shark_log
+                for seg in [self.social_segment_at(e["frame"])]
+            ],
             "clips": [dict(c) for c in self.clips],
             "features": [],
         }
@@ -1611,19 +1635,31 @@ class AnnotationTimeline(QWidget):
         social_labels = self.store.social_per_frame if self.store is not None else None
         draw_segment_row(social_y, social_labels, self._social_colors)
 
-        # shark-log markers on the social row: dark diamond + total count
+        # shark-log bands on the social row: each entry covers its whole
+        # social-interaction segment (dark underline band + ◆ + count)
         if self.store is not None and getattr(self.store, "shark_log", None):
             for e in self.store.shark_log:
+                seg_s, seg_e, _lab = self.store.social_segment_at(e["frame"])
+                bx_s = int(x0 + (seg_s / max(1, self.total_frames)) * w)
+                bx_e = int(x0 + ((seg_e + 1) / max(1, self.total_frames)) * w)
+                band_y = social_y + row_h - 5
+                p.setPen(Qt.PenStyle.NoPen if _QT6 else Qt.NoPen)
+                p.setBrush(QColor(15, 23, 42, 210))
+                p.drawRoundedRect(bx_s, band_y, max(3, bx_e - bx_s), 4, 2, 2)
+                # diamond at the exact log frame
                 ex = int(x0 + (e["frame"] / max(1, self.total_frames)) * w)
-                cy = social_y + row_h // 2
+                cy = band_y + 2
                 p.setPen(QPen(QColor(255, 255, 255), 1))
                 p.setBrush(QColor(15, 23, 42))
                 pts = [(ex, cy - 5), (ex + 5, cy), (ex, cy + 5), (ex - 5, cy)]
                 p.drawPolygon(QPolygon([QPoint(a, b) for a, b in pts]))
-                total = e.get("males", 0) + e.get("females", 0) + e.get("unknown", 0)
+                # total count right after the band (or inside its right end)
+                total = (e.get("males", 0) + e.get("females", 0)
+                         + e.get("unknown", 0))
                 ff = p.font(); ff.setPointSize(9); ff.setBold(True); p.setFont(ff)
                 p.setPen(QColor(15, 23, 42))
-                p.drawText(ex + 7, cy + 4, str(total))
+                tx = min(bx_e + 4, x0 + w - 14)
+                p.drawText(tx, band_y + 4, str(total))
 
         # --- Habitat row
         draw_left_label("Habitat", habitat_y)
@@ -2717,6 +2753,7 @@ class MainWindow(QMainWindow):
         self.store.set_social(self.current_frame_idx, label)
         if hasattr(self, "timeline"):
             self.timeline.update()
+        self._refresh_shark_log()   # spans derive from social segments
         self.statusBar().showMessage(f"Social: {label}")
 
     def _on_habitat_selected(self, label: str):
@@ -2948,9 +2985,11 @@ class MainWindow(QMainWindow):
             return
         self._push_undo()
         fi = self.current_frame_idx
-        # replace an existing entry on the same frame instead of duplicating
+        seg_s, seg_e, seg_lab = self.store.social_segment_at(fi)
+        # one composition per social interaction: replace any entry already
+        # inside this segment instead of duplicating
         self.store.shark_log = [e for e in self.store.shark_log
-                                if e["frame"] != fi]
+                                if not (seg_s <= e["frame"] <= seg_e)]
         entry = {"frame": fi, "males": m, "females": f, "unknown": u}
         self.store.shark_log.append(entry)
         self.store.shark_log.sort(key=lambda e: e["frame"])
@@ -2959,18 +2998,35 @@ class MainWindow(QMainWindow):
             self.timeline.update()
         for sp in (self.shark_m_spin, self.shark_f_spin, self.shark_u_spin):
             sp.setValue(0)
-        self.statusBar().showMessage(
-            f"Logged sharks at frame {fi}: {self._shark_entry_text(entry)}")
+        t = self.timeline._format_time
+        if seg_lab:
+            self.statusBar().showMessage(
+                f"Logged {self._shark_entry_text(entry)} for the whole "
+                f"'{seg_lab}' interaction "
+                f"[{t(seg_s / self.fps)}–{t(seg_e / self.fps)}].")
+        else:
+            self.statusBar().showMessage(
+                f"Logged {self._shark_entry_text(entry)} at frame {fi} — "
+                "tip: label the Social axis and the entry will cover the "
+                "whole interaction.")
 
     def _refresh_shark_log(self):
         if not hasattr(self, "shark_log_list"):
             return
         self.shark_log_list.clear()
         user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        tf = self.timeline._format_time
+        fps = max(1e-6, self.fps)
         for e in self.store.shark_log:
-            t = self.timeline._format_time(e["frame"] / max(1e-6, self.fps))
-            it = QListWidgetItem(f"[{t}]  {self._shark_entry_text(e)}")
-            it.setToolTip("Double-click to jump; select + Delete Entry to remove")
+            s, en, lab = self.store.social_segment_at(e["frame"])
+            if lab:
+                span = f"[{tf(s / fps)}–{tf(en / fps)}] {lab}"
+            else:
+                span = f"[{tf(e['frame'] / fps)}]"
+            text = f"{span} · {self._shark_entry_text(e)}"
+            it = QListWidgetItem(text)
+            it.setToolTip(text + "\nApplies to the whole social interaction. "
+                          "Double-click to jump; Delete Entry removes.")
             it.setData(user_role, e)
             self.shark_log_list.addItem(it)
 
@@ -3242,6 +3298,7 @@ class MainWindow(QMainWindow):
                 self._write_labels_at(f)
             if hasattr(self, "timeline"):
                 self.timeline.update()
+            self._refresh_shark_log()   # social spans may have grown
         self.seek_to(idx)
 
     def _tick(self):
@@ -4887,20 +4944,23 @@ class MainWindow(QMainWindow):
             row += 1
         _autowidth(wsn)
 
-        # ── Shark Log sheet (conspecifics logged from the Social bar) ─
+        # ── Shark Log sheet — each entry spans its whole social segment ─
         wss = wb.create_sheet("Shark Log")
-        _hrow(wss, ["Frame", "Time", "Males", "Females", "Unknown", "Total",
-                    "Social", "Movement", "Habitat", "Visibility"])
+        _hrow(wss, ["Start Frame", "Start Time", "End Frame", "End Time",
+                    "Duration (s)", "Social", "Males", "Females", "Unknown",
+                    "Total", "Movement", "Habitat", "Visibility"])
         wss.freeze_panes = "A2"
         for r, e in enumerate(sorted(store.shark_log,
                                      key=lambda x: x["frame"]), 2):
             fi = int(e["frame"])
+            seg_s, seg_e, seg_lab = store.social_segment_at(fi)
+            dur = (seg_e - seg_s + 1) / fps
             total = e.get("males", 0) + e.get("females", 0) + e.get("unknown", 0)
             for c, v in enumerate([
-                fi, _t(fi),
+                seg_s, _t(seg_s), seg_e, _t(seg_e), round(dur, 2),
+                seg_lab or "",
                 e.get("males", 0), e.get("females", 0), e.get("unknown", 0),
                 total,
-                soc_tl[fi] or "" if fi < len(soc_tl) else "",
                 mov_tl[fi] or "" if fi < len(mov_tl) else "",
                 hab_tl[fi] or "" if fi < len(hab_tl) else "",
                 vis_tl[fi] or "" if fi < len(vis_tl) else "",
@@ -4994,10 +5054,12 @@ class MainWindow(QMainWindow):
             "    habitats and species.\n\n"
             "CONSPECIFIC SHARKS (Social bar)\n"
             "  • Other sharks are a social observation, not a fish-ID box: on the\n"
-            "    Social bar set the ♂/♀/? counts and press Log to record the\n"
-            "    group at the current frame. Log again whenever it changes.\n"
-            "  • Entries show as ◆ markers on the Social timeline row and in the\n"
-            "    Shark log list (double-click to jump; Delete Entry removes).\n\n"
+            "    Social bar set the ♂/♀/? counts and press Log. The entry applies\n"
+            "    to the WHOLE social interaction containing that frame (e.g. all\n"
+            "    of a 'Brief interaction'), and follows it if you extend it.\n"
+            "  • Shown as a dark band + ◆ + count on the Social timeline row and\n"
+            "    in the Shark log list (double-click jumps; Delete Entry removes).\n"
+            "  • Logging again inside the same interaction replaces its entry.\n\n"
             "OTHER ANIMALS / BOUNDING BOXES\n"
             "  • Draw Bbox (or B), then click TWO corners (right-click cancels).\n"
             "  • Click a box on the video to select it; drag its corners to edit;\n"
