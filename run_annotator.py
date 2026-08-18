@@ -38,7 +38,7 @@ import numpy as np
 # Qt compatibility: prefer PyQt6, fall back to PyQt5
 # --------------------------------------------------------------------------
 try:
-    from PyQt6.QtCore import Qt, QTimer, QSize, QPoint, pyqtSignal
+    from PyQt6.QtCore import Qt, QTimer, QSize, QPoint, QRect, pyqtSignal
     from PyQt6.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QFont,
                              QShortcut, QKeySequence, QPolygon)
     from PyQt6.QtWidgets import (
@@ -46,11 +46,11 @@ try:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
-        QScrollArea, QCheckBox, QDialog, QTabWidget, QInputDialog,
+        QScrollArea, QCheckBox, QDialog, QTabWidget, QInputDialog, QLayout,
     )
     _QT6 = True
 except ImportError:
-    from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, pyqtSignal
+    from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, QRect, pyqtSignal
     from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QFont,
                              QShortcut, QKeySequence, QPolygon)
     from PyQt5.QtWidgets import (
@@ -58,7 +58,7 @@ except ImportError:
         QVBoxLayout, QFileDialog, QMessageBox, QListWidget,
         QListWidgetItem, QGroupBox, QLineEdit, QComboBox, QToolButton,
         QFrame, QSizePolicy, QProgressDialog, QSpinBox, QCompleter,
-        QScrollArea, QCheckBox, QDialog, QTabWidget, QInputDialog,
+        QScrollArea, QCheckBox, QDialog, QTabWidget, QInputDialog, QLayout,
     )
     _QT6 = False
 
@@ -92,8 +92,11 @@ SOCIAL_OPTIONS_DEFAULT = [
 MOVEMENT_OPTIONS = list(MOVEMENT_OPTIONS_DEFAULT)
 SOCIAL_OPTIONS = list(SOCIAL_OPTIONS_DEFAULT)
 
-# Water visibility — its own persist-until-changed axis (fixed 5-point scale).
-VISIBILITY_OPTIONS = ["Very bad", "Bad", "Fine", "Good", "Very good"]
+# Water visibility — its own persist-until-changed axis (fixed 4-point scale).
+# "Very bad" was removed deliberately: footage that bad isn't worth processing,
+# so it never needs a label. Old files using it migrate to "Bad" on load.
+VISIBILITY_OPTIONS = ["Bad", "Fine", "Good", "Very good"]
+VISIBILITY_LEGACY_MAP = {"Very bad": "Bad", "Poor": "Bad", "Moderate": "Fine"}
 
 # Per-feature metadata option lists
 CONFIDENCE_OPTIONS = ["", "High", "Medium", "Low"]
@@ -444,6 +447,7 @@ ALL_SPECIES = [s for species in SPECIES_CATEGORIES.values() for s in species]
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), "CTAG_Annotator")
 SPECIES_CSV = os.path.join(CONFIG_DIR, "species.csv")
+TAXONOMY_CSV = os.path.join(CONFIG_DIR, "taxonomy.csv")
 BEHAVIORS_CSV = os.path.join(CONFIG_DIR, "behaviors.csv")
 HABITATS_CSV = os.path.join(CONFIG_DIR, "habitats.csv")
 # Guaranteed-local place for annotations/autosaves — lives in the user's home
@@ -469,6 +473,200 @@ _CLOUD_PATH_MARKERS = (
 def is_cloud_path(path: str) -> bool:
     """True if `path` appears to live inside a cloud-synced virtual filesystem."""
     return any(m in (path or "") for m in _CLOUD_PATH_MARKERS)
+
+
+# --------------------------------------------------------------------------
+# Taxonomy — genus → family, so IDs can be recorded at family, genus or
+# species level and the three pickers can fill each other in.
+# --------------------------------------------------------------------------
+GENUS_FAMILY = {
+    # Sharks
+    "Ginglymostoma": "Ginglymostomatidae", "Negaprion": "Carcharhinidae",
+    # Rays
+    "Aetobatus": "Myliobatidae", "Gymnura": "Gymnuridae", "Hypanus": "Dasyatidae",
+    "Mobula": "Mobulidae", "Pseudobatos": "Rhinobatidae",
+    "Rhinoptera": "Rhinopteridae", "Styracura": "Dasyatidae",
+    "Urobatis": "Urotrygonidae", "Urotrygon": "Urotrygonidae",
+    # Sea turtles
+    "Chelonia": "Cheloniidae", "Eretmochelys": "Cheloniidae",
+    "Lepidochelys": "Cheloniidae",
+    # Teleosts
+    "Abudefduf": "Pomacentridae", "Acanthemblemaria": "Chaenopsidae",
+    "Acanthurus": "Acanthuridae", "Alectis": "Carangidae",
+    "Alphestes": "Serranidae", "Aluterus": "Monacanthidae",
+    "Anisotremus": "Haemulidae", "Apogon": "Apogonidae",
+    "Arothron": "Tetraodontidae", "Aulostomus": "Aulostomidae",
+    "Axoclinus": "Tripterygiidae", "Azurina": "Pomacentridae",
+    "Balistes": "Balistidae", "Bodianus": "Labridae", "Bothus": "Bothidae",
+    "Calamus": "Sparidae", "Canthigaster": "Tetraodontidae",
+    "Caranx": "Carangidae", "Centropomus": "Centropomidae",
+    "Cephalopholis": "Serranidae", "Chaenopsis": "Chaenopsidae",
+    "Chaetodipterus": "Ephippidae", "Chaetodon": "Chaetodontidae",
+    "Chilomycterus": "Diodontidae", "Cirrhitichthys": "Cirrhitidae",
+    "Cirrhitus": "Cirrhitidae", "Coryphaena": "Coryphaenidae",
+    "Coryphopterus": "Gobiidae", "Dermatolepis": "Serranidae",
+    "Diodon": "Diodontidae", "Doryrhamphus": "Syngnathidae",
+    "Echidna": "Muraenidae", "Elacatinus": "Gobiidae",
+    "Elagatis": "Carangidae", "Elops": "Elopidae",
+    "Epinephelus": "Serranidae", "Eucinostomus": "Gerreidae",
+    "Euthynnus": "Scombridae", "Fistularia": "Fistulariidae",
+    "Gerres": "Gerreidae", "Gnathanodon": "Carangidae",
+    "Gymnomuraena": "Muraenidae", "Gymnothorax": "Muraenidae",
+    "Haemulon": "Haemulidae", "Halichoeres": "Labridae",
+    "Holacanthus": "Pomacanthidae", "Hoplopagrus": "Lutjanidae",
+    "Iniistius": "Labridae", "Johnrandallia": "Chaetodontidae",
+    "Kyphosus": "Kyphosidae", "Lutjanus": "Lutjanidae",
+    "Malacanthus": "Malacanthidae", "Malacoctenus": "Labrisomidae",
+    "Microlepidotus": "Haemulidae", "Microspathodon": "Pomacentridae",
+    "Mugil": "Mugilidae", "Mulloidichthys": "Mullidae",
+    "Muraena": "Muraenidae", "Mycteroperca": "Serranidae",
+    "Myrichthys": "Ophichthidae", "Myripristis": "Holocentridae",
+    "Nematistius": "Nematistiidae", "Novaculichthys": "Labridae",
+    "Ophichthus": "Ophichthidae", "Ophioblennius": "Blenniidae",
+    "Ostracion": "Ostraciidae", "Paranthias": "Serranidae",
+    "Plagiotremus": "Blenniidae", "Pomacanthus": "Pomacanthidae",
+    "Prionurus": "Acanthuridae", "Pseudobalistes": "Balistidae",
+    "Pseudupeneus": "Mullidae", "Quassiremus": "Ophichthidae",
+    "Rypticus": "Serranidae", "Sargocentron": "Holocentridae",
+    "Scarus": "Scaridae", "Scomberomorus": "Scombridae",
+    "Scorpaena": "Scorpaenidae", "Scuticaria": "Muraenidae",
+    "Seriola": "Carangidae", "Serranus": "Serranidae",
+    "Sphoeroides": "Tetraodontidae", "Sphyraena": "Sphyraenidae",
+    "Stegastes": "Pomacentridae", "Sufflamen": "Balistidae",
+    "Synodus": "Synodontidae", "Thalassoma": "Labridae",
+    "Trachinotus": "Carangidae", "Tylosurus": "Belonidae",
+}
+
+_SPECIES_RE = re.compile(r"^(.*?)\s*\(([A-Z][a-z]+)\s+([a-z][a-z\-]*)\)\s*$")
+
+
+def _build_default_taxonomy():
+    """Expand the curated flat lists into structured taxonomy rows.
+
+    Each row: category, family, genus, species (binomial), common.
+    Blank genus/species means the entry only resolves to that higher rank.
+    """
+    rows = []
+    for cat, items in SPECIES_CATEGORIES_DEFAULT.items():
+        for it in items:
+            m = _SPECIES_RE.match(it)
+            if m:
+                common, gen, epithet = m.group(1).strip(), m.group(2), m.group(3)
+                rows.append({"category": cat, "family": GENUS_FAMILY.get(gen, ""),
+                             "genus": gen, "species": f"{gen} {epithet}",
+                             "common": common})
+            elif it.endswith(" sp."):
+                gen = it[:-4].strip()
+                rows.append({"category": cat, "family": GENUS_FAMILY.get(gen, ""),
+                             "genus": gen, "species": "", "common": ""})
+            elif it:
+                rows.append({"category": cat, "family": it,
+                             "genus": "", "species": "", "common": ""})
+    return rows
+
+
+class Taxonomy:
+    """Indexed taxonomy supporting family/genus/species lookups in any order."""
+
+    FIELDS = ["category", "family", "genus", "species", "common"]
+
+    def __init__(self, rows=None):
+        self.rows = rows if rows is not None else []
+        self.reindex()
+
+    def reindex(self):
+        self.categories = []
+        self._fam_of_genus = {}
+        self._cat_of_family = {}
+        for r in self.rows:
+            c = r.get("category") or "Other"
+            if c not in self.categories:
+                self.categories.append(c)
+            if r.get("genus") and r.get("family"):
+                self._fam_of_genus.setdefault(r["genus"], r["family"])
+            if r.get("family"):
+                self._cat_of_family.setdefault(r["family"], c)
+
+    def _scope(self, category=None):
+        if not category or category == "Other":
+            return self.rows
+        return [r for r in self.rows if r.get("category") == category]
+
+    def families(self, category=None):
+        seen = []
+        for r in self._scope(category):
+            f = r.get("family")
+            if f and f not in seen:
+                seen.append(f)
+        return sorted(seen)
+
+    def genera(self, category=None, family=None):
+        seen = []
+        for r in self._scope(category):
+            if family and r.get("family") != family:
+                continue
+            g = r.get("genus")
+            if g and g not in seen:
+                seen.append(g)
+        return sorted(seen)
+
+    def species_rows(self, category=None, family=None, genus=None):
+        out = []
+        for r in self._scope(category):
+            if not r.get("species"):
+                continue
+            if family and r.get("family") != family:
+                continue
+            if genus and r.get("genus") != genus:
+                continue
+            out.append(r)
+        return sorted(out, key=lambda r: r["species"])
+
+    def family_of_genus(self, genus):
+        return self._fam_of_genus.get(genus, "")
+
+    def category_of_family(self, family):
+        return self._cat_of_family.get(family, "")
+
+    def row_for_species(self, binomial):
+        for r in self.rows:
+            if r.get("species") == binomial:
+                return r
+        return None
+
+    def search(self, text, category=None, limit=60):
+        """Rank-tagged fuzzy search across family, genus, species and common
+        name — this is the 'I already know what it is, let me type it' path."""
+        q = (text or "").strip().lower()
+        if not q:
+            return []
+        hits, seen = [], set()
+
+        def add(kind, label, row, score):
+            key = (kind, label)
+            if key not in seen:
+                seen.add(key)
+                hits.append({"kind": kind, "label": label, "row": row, "score": score})
+
+        for r in self._scope(category):
+            sp, com, gen, fam = (r.get("species", ""), r.get("common", ""),
+                                 r.get("genus", ""), r.get("family", ""))
+            if sp:
+                hay = f"{com} {sp}".lower()
+                if q in hay:
+                    add("species", f"{com} ({sp})" if com else sp, r,
+                        0 if hay.startswith(q) else 1)
+            if gen and q in gen.lower():
+                add("genus", gen, r, 0 if gen.lower().startswith(q) else 1)
+            if fam and q in fam.lower():
+                add("family", fam, r, 0 if fam.lower().startswith(q) else 1)
+
+        rank = {"species": 0, "genus": 1, "family": 2}
+        hits.sort(key=lambda h: (h["score"], rank[h["kind"]], h["label"]))
+        return hits[:limit]
+
+
+TAXONOMY = Taxonomy()
 
 
 def _ensure_config_dir():
@@ -560,6 +758,100 @@ def load_behaviors_config():
 
     return (movement or list(MOVEMENT_OPTIONS_DEFAULT),
             social or list(SOCIAL_OPTIONS_DEFAULT))
+
+
+def write_taxonomy_csv(rows):
+    _ensure_config_dir()
+    with open(TAXONOMY_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=Taxonomy.FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in Taxonomy.FIELDS})
+
+
+def load_taxonomy_config():
+    """Load taxonomy.csv, seeding it from the curated defaults on first run."""
+    if not os.path.exists(TAXONOMY_CSV):
+        rows = _build_default_taxonomy()
+        try:
+            write_taxonomy_csv(rows)
+        except OSError:
+            pass
+        return Taxonomy(rows)
+    rows = []
+    try:
+        with open(TAXONOMY_CSV, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                r = {k: (row.get(k) or "").strip() for k in Taxonomy.FIELDS}
+                if any(r[k] for k in ("family", "genus", "species")):
+                    r["category"] = r["category"] or "Other"
+                    if not r["family"] and r["genus"]:
+                        r["family"] = GENUS_FAMILY.get(r["genus"], "")
+                    rows.append(r)
+    except (OSError, csv.Error):
+        rows = _build_default_taxonomy()
+    return Taxonomy(rows or _build_default_taxonomy())
+
+
+def import_taxonomy_csv(path, replace=True):
+    """Import a user taxonomy CSV.
+
+    Accepts the full category/family/genus/species/common form, or simpler
+    files: a single column of names, or family,genus,species. Anything the
+    header doesn't name is inferred (genus from the binomial, family from
+    the built-in genus->family table).
+    """
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        raw = list(csv.reader(f))
+    if not raw:
+        raise ValueError("CSV is empty.")
+    header = [h.strip().lower() for h in raw[0]]
+    known = {"category", "family", "genus", "species", "common", "common_name"}
+    has_header = any(h in known for h in header)
+    rows = []
+    if has_header:
+        idx = {h: i for i, h in enumerate(header)}
+        for line in raw[1:]:
+            def get(name):
+                i = idx.get(name)
+                return (line[i].strip() if i is not None and i < len(line) else "")
+            r = {"category": get("category") or "Other",
+                 "family": get("family"), "genus": get("genus"),
+                 "species": get("species"),
+                 "common": get("common") or get("common_name")}
+            rows.append(r)
+    else:
+        for line in raw:
+            if not line:
+                continue
+            name = line[0].strip()
+            if not name:
+                continue
+            rows.append({"category": "Other", "family": "", "genus": "",
+                         "species": name, "common": ""})
+    # normalise: infer genus from binomial, family from genus
+    clean = []
+    for r in rows:
+        sp = r["species"]
+        m = _SPECIES_RE.match(sp)
+        if m:  # someone pasted "Common (Genus epithet)"
+            r["common"] = r["common"] or m.group(1).strip()
+            r["genus"] = r["genus"] or m.group(2)
+            sp = f"{m.group(2)} {m.group(3)}"
+        if sp and not r["genus"]:
+            parts = sp.split()
+            if len(parts) >= 2 and parts[0][:1].isupper():
+                r["genus"] = parts[0]
+        if not r["family"] and r["genus"]:
+            r["family"] = GENUS_FAMILY.get(r["genus"], "")
+        r["species"] = sp
+        if any(r[k] for k in ("family", "genus", "species")):
+            clean.append(r)
+    if not clean:
+        raise ValueError("No usable taxonomy rows found in the CSV.")
+    if not replace:
+        clean = load_taxonomy_config().rows + clean
+    write_taxonomy_csv(clean)
 
 
 def _seed_habitats_csv():
@@ -738,17 +1030,23 @@ def restore_default(kind: str):
         write_behaviors_csv(list(MOVEMENT_OPTIONS_DEFAULT), list(SOCIAL_OPTIONS_DEFAULT))
     elif kind == "habitats":
         write_habitats_csv(list(HABITAT_OPTIONS_DEFAULT))
+    elif kind == "taxonomy":
+        write_taxonomy_csv(_build_default_taxonomy())
 
 
 def load_all_label_config():
     """Populate the runtime global label lists from the CSV config files."""
     global SPECIES_CATEGORIES, SPECIES_CATEGORY_ORDER, ALL_SPECIES
-    global MOVEMENT_OPTIONS, SOCIAL_OPTIONS, HABITAT_OPTIONS
+    global MOVEMENT_OPTIONS, SOCIAL_OPTIONS, HABITAT_OPTIONS, TAXONOMY
     SPECIES_CATEGORIES = load_species_config()
     SPECIES_CATEGORY_ORDER = list(SPECIES_CATEGORIES.keys())
     ALL_SPECIES = [s for sps in SPECIES_CATEGORIES.values() for s in sps]
     MOVEMENT_OPTIONS, SOCIAL_OPTIONS = load_behaviors_config()
     HABITAT_OPTIONS = load_habitats_config()
+    TAXONOMY = load_taxonomy_config()
+    for c in TAXONOMY.categories:
+        if c not in SPECIES_CATEGORY_ORDER:
+            SPECIES_CATEGORY_ORDER.append(c)
 
 
 # Modern-ish palette (RGB) for tracked features
@@ -952,7 +1250,10 @@ class TrackedFeature:
     color_idx: int = 0
     count: int = 1
     species_category: str = ""  # Shark / Ray / Teleost fish / Sea turtle / Other
-    species: str = ""           # specific species name (or family, for hard IDs)
+    species: str = ""           # binomial, e.g. "Negaprion brevirostris" ("" if not to species)
+    family: str = ""            # e.g. "Carcharhinidae"
+    genus: str = ""             # e.g. "Negaprion"
+    common: str = ""            # common name, e.g. "Lemon shark"
     confidence: str = ""        # "" | High | Medium | Low
     sex: str = ""               # "" | Male | Female | Unknown (single/first animal)
     # per-individual sexes for a group (e.g. several sharks in one interaction);
@@ -962,6 +1263,26 @@ class TrackedFeature:
     def __post_init__(self):
         if self.sexes is None:
             self.sexes = []
+
+    def id_level(self) -> str:
+        """Lowest taxonomic rank this animal was actually identified to."""
+        if self.species:
+            return "species"
+        if self.genus:
+            return "genus"
+        if self.family:
+            return "family"
+        return ""
+
+    def id_label(self) -> str:
+        """Best human-readable identification string for this animal."""
+        if self.species:
+            return f"{self.common} ({self.species})" if self.common else self.species
+        if self.genus:
+            return f"{self.genus} sp."
+        if self.family:
+            return self.family
+        return self.species_category or ""
 
     def sex_summary(self) -> str:
         """Compact '2♂ 1♀ 1?' string, or '' if no per-individual sexes."""
@@ -1141,6 +1462,10 @@ class FeatureStore:
                 "count": feat.count,
                 "species_category": feat.species_category,
                 "species": feat.species,
+                "family": feat.family,
+                "genus": feat.genus,
+                "common": feat.common,
+                "id_level": feat.id_level(),
                 "confidence": feat.confidence,
                 "sex": feat.sex,
                 "sexes": list(feat.sexes or []),
@@ -1180,7 +1505,12 @@ class FeatureStore:
         _apply(scene.get("social_segments", []), store.set_social)
         _apply(scene.get("habitat_segments", scene.get("substrate_segments", [])),
                store.set_habitat)
-        _apply(scene.get("visibility_segments", []), store.set_visibility)
+        # Visibility: map retired scale values onto the current 4-point scale
+        # so older annotation files keep working.
+        def _set_visibility_migrated(fi, value):
+            store.set_visibility(fi, VISIBILITY_LEGACY_MAP.get(value, value))
+
+        _apply(scene.get("visibility_segments", []), _set_visibility_migrated)
 
         for nd in data.get("notes", []):
             try:
@@ -1211,7 +1541,33 @@ class FeatureStore:
             except (KeyError, ValueError, TypeError):
                 continue
 
+        def _migrate_species(fd):
+            """Older files stored one free-text 'species' string that could be a
+            display name, a genus ('Negaprion sp.') or a family. Split it into
+            the family/genus/species fields so old work keeps its ID level."""
+            raw = (fd.get("species") or "").strip()
+            fam = (fd.get("family") or "").strip()
+            gen = (fd.get("genus") or "").strip()
+            common = (fd.get("common") or "").strip()
+            if fam or gen or not raw:
+                return fam, gen, raw if (fam or gen) else raw, common
+            m = _SPECIES_RE.match(raw)
+            if m:
+                common = common or m.group(1).strip()
+                gen = m.group(2)
+                return GENUS_FAMILY.get(gen, ""), gen, f"{gen} {m.group(3)}", common
+            if raw.endswith(" sp."):
+                gen = raw[:-4].strip()
+                return GENUS_FAMILY.get(gen, ""), gen, "", ""
+            if raw.endswith("idae"):
+                return raw, "", "", ""
+            parts = raw.split()
+            if len(parts) == 2 and parts[0][:1].isupper() and parts[1].islower():
+                return GENUS_FAMILY.get(parts[0], ""), parts[0], raw, common
+            return "", "", raw, common
+
         for fd in data.get("features", []):
+            _fam, _gen, _sp, _common = _migrate_species(fd)
             feat = TrackedFeature(
                 name=fd.get("name", "feature"),
                 init_frame=int(fd.get("init_frame", 0)),
@@ -1221,7 +1577,10 @@ class FeatureStore:
                 color_idx=int(fd.get("color_idx", 0)),
                 count=int(fd.get("count", 1)),
                 species_category=fd.get("species_category", fd.get("feature_type", "")),
-                species=fd.get("species", ""),
+                species=_sp,
+                family=_fam,
+                genus=_gen,
+                common=_common,
                 confidence=fd.get("confidence", ""),
                 sex=fd.get("sex", ""),
                 sexes=list(fd.get("sexes", []) or []),
@@ -1241,6 +1600,87 @@ class FeatureStore:
 # --------------------------------------------------------------------------
 # VideoLabel — displays frames; click/drag signals kept for possible future use
 # --------------------------------------------------------------------------
+
+class FlowLayout(QLayout):
+    """A layout that wraps its widgets onto new rows when width runs out.
+
+    The label bars (Movement/Social/Habitat/Visibility) used a QHBoxLayout,
+    whose minimum width is the sum of every button — that forced the whole
+    window wider than a 13" laptop screen and pushed the control panel off
+    the display. Wrapping lets a bar shrink to one button wide and grow
+    taller instead, so the window fits any screen.
+    """
+
+    def __init__(self, parent=None, margin=0, spacing=5):
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def __del__(self):
+        while self.count():
+            self.takeAt(0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def insertWidget(self, index, widget):
+        self.addWidget(widget)
+        item = self._items.pop()
+        self._items.insert(max(0, min(index, len(self._items))), item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        x, y = rect.x() + m.left(), rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_height = 0
+        space = self.spacing()
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + space
+            if next_x - space > right and line_height > 0:
+                x = rect.x() + m.left()
+                y = y + line_height + space
+                next_x = x + hint.width() + space
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + m.bottom()
+
 
 class VideoLabel(QLabel):
     pointClicked = pyqtSignal(object)           # QPoint — click on empty area
@@ -1490,9 +1930,8 @@ class AnnotationTimeline(QWidget):
             self._habitat_colors[h] = _known_hab.get(
                 h, QColor(*FEATURE_COLORS[i % len(FEATURE_COLORS)]))
 
-        # Colors for the 5-point visibility scale (red → green)
+        # Colors for the 4-point visibility scale (red → green)
         self._visibility_colors = {
-            "Very bad": QColor(190, 18, 60),
             "Bad": QColor(239, 68, 68),
             "Fine": QColor(245, 158, 11),
             "Good": QColor(34, 197, 94),
@@ -1804,6 +2243,329 @@ class AnnotationTimeline(QWidget):
 
 
 # --------------------------------------------------------------------------
+# Taxonomy picker — record an ID at whatever rank the annotator can manage
+# --------------------------------------------------------------------------
+
+class TaxonomyPicker(QWidget):
+    """Family / Genus / Species pickers plus a single 'find' box.
+
+    Two ways to work, so nobody is forced through steps they don't need:
+      • Know the animal → type it in "Find" (or straight into Species) and the
+        higher ranks back-fill automatically.
+      • Only know it to family/genus → fill just that box and stop; the ID
+        level is recorded honestly as family or genus.
+    Choosing a family narrows the genus and species lists for browsing.
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._updating = False
+        self._category = ""
+        self._find_map = {}
+        self._common = ""
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        # --- quick find across every rank at once
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText("Find species / genus / family…")
+        self.find_edit.setClearButtonEnabled(True)
+        self._find_completer = QCompleter([], self)
+        self._set_contains(self._find_completer)
+        self._find_completer.setMaxVisibleItems(14)
+        self.find_edit.setCompleter(self._find_completer)
+        self.find_edit.textEdited.connect(self._refresh_find_model)
+        self._find_completer.activated[str].connect(self._on_find_activated)
+        find_row = QHBoxLayout()
+        find_row.setSpacing(6)
+        fl = QLabel("Find:")
+        fl.setMinimumWidth(52)
+        find_row.addWidget(fl)
+        find_row.addWidget(self.find_edit, stretch=1)
+        lay.addLayout(find_row)
+
+        # --- the three rank boxes
+        self.family_combo = self._mk_combo("Family")
+        self.genus_combo = self._mk_combo("Genus")
+        self.species_combo = self._mk_combo("Species")
+        for label, combo, adder in (("Family:", self.family_combo, None),
+                                    ("Genus:", self.genus_combo, None),
+                                    ("Species:", self.species_combo, self._add_species)):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            lb = QLabel(label)
+            lb.setMinimumWidth(52)
+            row.addWidget(lb)
+            row.addWidget(combo, stretch=1)
+            if adder is not None:
+                b = QToolButton()
+                b.setText("＋")
+                b.setProperty("segmented", True)
+                b.setToolTip("Add a new species to the taxonomy")
+                b.clicked.connect(adder)
+                row.addWidget(b)
+            lay.addLayout(row)
+
+        self.family_combo.currentTextChanged.connect(self._on_family)
+        self.genus_combo.currentTextChanged.connect(self._on_genus)
+        self.species_combo.currentTextChanged.connect(self._on_species)
+
+        # --- honest read-out of how far the ID got
+        bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        self.level_lbl = QLabel("Not identified")
+        self.level_lbl.setObjectName("Subtle")
+        clear_btn = QToolButton()
+        clear_btn.setText("Clear")
+        clear_btn.setProperty("segmented", True)
+        clear_btn.clicked.connect(self.clear)
+        bottom.addWidget(self.level_lbl, stretch=1)
+        bottom.addWidget(clear_btn)
+        lay.addLayout(bottom)
+
+    # ---------------------------------------------------------------- utils
+    @staticmethod
+    def _set_contains(completer):
+        try:
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        except AttributeError:
+            completer.setFilterMode(Qt.MatchContains)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            completer.setCompletionMode(QCompleter.PopupCompletion)
+
+    def _mk_combo(self, placeholder):
+        c = QComboBox()
+        c.setEditable(True)
+        c.setInsertPolicy(QComboBox.InsertPolicy.NoInsert if _QT6
+                          else QComboBox.NoInsert)
+        try:
+            c.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        except AttributeError:
+            c.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        c.setMinimumContentsLength(10)
+        c.lineEdit().setPlaceholderText(placeholder)
+        c.lineEdit().setClearButtonEnabled(True)
+        self._set_contains(c.completer())
+        return c
+
+    @staticmethod
+    def _fill(combo, items, keep=""):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("")
+        combo.addItems(items)
+        combo.setCurrentIndex(0)
+        if keep:
+            i = combo.findText(keep)
+            if i >= 0:
+                combo.setCurrentIndex(i)
+            else:
+                combo.setEditText(keep)
+        # show the START of a long name rather than its scrolled-to-end tail
+        if combo.lineEdit() is not None:
+            combo.lineEdit().setCursorPosition(0)
+        combo.blockSignals(False)
+
+    @staticmethod
+    def _species_display(row):
+        return f"{row['common']} ({row['species']})" if row.get("common") else row["species"]
+
+    # ------------------------------------------------------------- find box
+    def _refresh_find_model(self, text):
+        hits = TAXONOMY.search(text, self._category or None)
+        labels, self._find_map = [], {}
+        for h in hits:
+            tag = {"species": "species", "genus": "genus", "family": "family"}[h["kind"]]
+            label = f"{h['label']}   · {tag}"
+            labels.append(label)
+            self._find_map[label] = h
+        try:
+            self._find_completer.model().setStringList(labels)
+        except AttributeError:
+            from PyQt6.QtCore import QStringListModel
+            self._find_completer.setModel(QStringListModel(labels))
+
+    def _on_find_activated(self, label):
+        h = self._find_map.get(label)
+        if not h:
+            return
+        row = h["row"]
+        if h["kind"] == "species":
+            self.set_value(row.get("family", ""), row.get("genus", ""),
+                           row.get("species", ""), row.get("common", ""))
+        elif h["kind"] == "genus":
+            self.set_value(row.get("family", ""), row.get("genus", ""), "", "")
+        else:
+            self.set_value(row.get("family", ""), "", "", "")
+        self.find_edit.clear()
+        self.changed.emit()
+
+    # ------------------------------------------------------- cascade logic
+    def _on_family(self, fam):
+        if self._updating:
+            return
+        self._updating = True
+        fam = fam.strip()
+        genus = self.genus_combo.currentText().strip()
+        if genus and TAXONOMY.family_of_genus(genus) != fam:
+            genus = ""
+        self._fill(self.genus_combo, TAXONOMY.genera(self._category or None, fam or None), genus)
+        self._refill_species(fam, genus)
+        self._updating = False
+        self._sync_level()
+        self.changed.emit()
+
+    def _on_genus(self, gen):
+        if self._updating:
+            return
+        self._updating = True
+        gen = gen.strip()
+        fam = TAXONOMY.family_of_genus(gen) or self.family_combo.currentText().strip()
+        if fam and fam != self.family_combo.currentText().strip():
+            self._fill(self.family_combo,
+                       TAXONOMY.families(self._category or None), fam)
+        self._refill_species(fam, gen)
+        self._updating = False
+        self._sync_level()
+        self.changed.emit()
+
+    def _on_species(self, disp):
+        if self._updating:
+            return
+        self._updating = True
+        disp = disp.strip()
+        row = None
+        for r in TAXONOMY.species_rows(self._category or None):
+            if self._species_display(r) == disp or r["species"] == disp:
+                row = r
+                break
+        if row:
+            self._common = row.get("common", "")
+            fam, gen = row.get("family", ""), row.get("genus", "")
+            if fam:
+                self._fill(self.family_combo,
+                           TAXONOMY.families(self._category or None), fam)
+            if gen:
+                self._fill(self.genus_combo,
+                           TAXONOMY.genera(self._category or None, fam or None), gen)
+        else:
+            self._common = ""
+        self._updating = False
+        self._sync_level()
+        self.changed.emit()
+
+    def _refill_species(self, family, genus):
+        rows = TAXONOMY.species_rows(self._category or None,
+                                     family or None, genus or None)
+        cur = self.species_combo.currentText().strip()
+        labels = [self._species_display(r) for r in rows]
+        self._fill(self.species_combo, labels, cur if cur in labels else "")
+
+    # ------------------------------------------------------------- public
+    def set_category(self, category):
+        self._category = category or ""
+        cur = self.value()
+        self._updating = True
+        self._fill(self.family_combo, TAXONOMY.families(self._category or None),
+                   cur["family"])
+        self._fill(self.genus_combo,
+                   TAXONOMY.genera(self._category or None, cur["family"] or None),
+                   cur["genus"])
+        self._refill_species(cur["family"], cur["genus"])
+        self._updating = False
+        self._sync_level()
+
+    def value(self):
+        sp_disp = self.species_combo.currentText().strip()
+        species, common = sp_disp, self._common
+        m = _SPECIES_RE.match(sp_disp)
+        if m:
+            common, species = m.group(1).strip(), f"{m.group(2)} {m.group(3)}"
+        return {"family": self.family_combo.currentText().strip(),
+                "genus": self.genus_combo.currentText().strip(),
+                "species": species, "common": common}
+
+    def set_value(self, family="", genus="", species="", common=""):
+        self._updating = True
+        self._common = common or ""
+        if not family and genus:
+            family = TAXONOMY.family_of_genus(genus)
+        self._fill(self.family_combo, TAXONOMY.families(self._category or None), family)
+        self._fill(self.genus_combo,
+                   TAXONOMY.genera(self._category or None, family or None), genus)
+        rows = TAXONOMY.species_rows(self._category or None,
+                                     family or None, genus or None)
+        labels = [self._species_display(r) for r in rows]
+        disp = ""
+        if species:
+            row = TAXONOMY.row_for_species(species)
+            disp = self._species_display(row) if row else (
+                f"{common} ({species})" if common else species)
+        self._fill(self.species_combo, labels, disp)
+        self._updating = False
+        self._sync_level()
+
+    def id_level(self):
+        v = self.value()
+        if v["species"]:
+            return "species"
+        if v["genus"]:
+            return "genus"
+        if v["family"]:
+            return "family"
+        return ""
+
+    def clear(self):
+        self.set_value("", "", "", "")
+        self.find_edit.clear()
+        self.changed.emit()
+
+    def _sync_level(self):
+        lvl = self.id_level()
+        pretty = {"species": "Identified to species",
+                  "genus": "Identified to genus",
+                  "family": "Identified to family",
+                  "": "Not identified"}[lvl]
+        self.level_lbl.setText(pretty)
+
+    def _add_species(self):
+        fam = self.family_combo.currentText().strip()
+        gen = self.genus_combo.currentText().strip()
+        text, ok = QInputDialog.getText(
+            self, "Add species",
+            "Binomial (e.g. Negaprion brevirostris) — optionally 'Common (Genus species)':")
+        if not ok or not text.strip():
+            return
+        raw = text.strip()
+        common, species = "", raw
+        m = _SPECIES_RE.match(raw)
+        if m:
+            common, species = m.group(1).strip(), f"{m.group(2)} {m.group(3)}"
+        parts = species.split()
+        if not gen and parts and parts[0][:1].isupper():
+            gen = parts[0]
+        if not fam and gen:
+            fam = TAXONOMY.family_of_genus(gen)
+        row = {"category": self._category or "Other", "family": fam,
+               "genus": gen, "species": species, "common": common}
+        TAXONOMY.rows.append(row)
+        TAXONOMY.reindex()
+        try:
+            write_taxonomy_csv(TAXONOMY.rows)
+        except OSError as e:
+            QMessageBox.warning(self, "Could not save taxonomy", str(e))
+        self.set_value(fam, gen, species, common)
+        self.changed.emit()
+
+
+# --------------------------------------------------------------------------
 # Label manager — add/remove/import/restore for behaviors, habitats, species
 # --------------------------------------------------------------------------
 
@@ -1922,6 +2684,7 @@ class LabelManagerDialog(QDialog):
         v.addLayout(btn_row)
 
     def _species_tab(self):
+        """Taxonomy tab — browse/edit by category, showing rank for each row."""
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(6, 6, 6, 6)
@@ -1932,6 +2695,12 @@ class LabelManagerDialog(QDialog):
         top.addWidget(QLabel("Category:"))
         top.addWidget(self.sp_cat, stretch=1)
         lay.addLayout(top)
+        hint = QLabel("Import a CSV with columns: category, family, genus, "
+                      "species, common  (extra columns ignored; a single column "
+                      "of names also works).")
+        hint.setObjectName("Subtle")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
         self.sp_list = QListWidget()
         lay.addWidget(self.sp_list, stretch=1)
         row = QHBoxLayout()
@@ -1943,61 +2712,100 @@ class LabelManagerDialog(QDialog):
             b.clicked.connect(fn)
             row.addWidget(b)
         lay.addLayout(row)
-        # working copy of the species dict, committed on Save
-        self._sp_work = {c: list(v) for c, v in SPECIES_CATEGORIES.items()}
+        # working copy of the taxonomy rows, committed on Save
+        self._tax_work = [dict(r) for r in TAXONOMY.rows]
         self._reload_species_list()
         return w
+
+    @staticmethod
+    def _tax_row_text(r):
+        if r.get("species"):
+            base = f"{r['common']} ({r['species']})" if r.get("common") else r["species"]
+            return f"{base}   · species"
+        if r.get("genus"):
+            return f"{r['genus']}   · genus"
+        return f"{r.get('family','')}   · family"
 
     def _reload_species_list(self, *_):
         cat = self.sp_cat.currentText()
         self.sp_list.clear()
-        self.sp_list.addItems(self._sp_work.get(cat, []))
+        self._tax_visible = [r for r in self._tax_work
+                             if (r.get("category") or "Other") == cat]
+        rank = {"family": 0, "genus": 1, "species": 2}
+        self._tax_visible.sort(key=lambda r: (
+            r.get("family", ""),
+            rank["species" if r.get("species") else ("genus" if r.get("genus") else "family")],
+            r.get("genus", ""), r.get("species", "")))
+        for r in self._tax_visible:
+            self.sp_list.addItem(self._tax_row_text(r))
 
     def _sp_add(self):
         cat = self.sp_cat.currentText()
-        text, ok = QInputDialog.getText(self, "Add species", f"New species in {cat}:")
-        if ok and text.strip():
-            self._sp_work.setdefault(cat, [])
-            if text.strip() not in self._sp_work[cat]:
-                self._sp_work[cat].append(text.strip())
-                self._reload_species_list()
+        text, ok = QInputDialog.getText(
+            self, "Add taxon",
+            f"Add to {cat} — a family (Carcharhinidae), a genus (Negaprion sp.)\n"
+            "or a species (Negaprion brevirostris / Lemon shark (Negaprion brevirostris)):")
+        if not (ok and text.strip()):
+            return
+        raw = text.strip()
+        r = {"category": cat, "family": "", "genus": "", "species": "", "common": ""}
+        m = _SPECIES_RE.match(raw)
+        if m:
+            r["common"], r["genus"] = m.group(1).strip(), m.group(2)
+            r["species"] = f"{m.group(2)} {m.group(3)}"
+        elif raw.endswith(" sp."):
+            r["genus"] = raw[:-4].strip()
+        elif raw.endswith("idae"):
+            r["family"] = raw
+        else:
+            parts = raw.split()
+            if len(parts) >= 2 and parts[0][:1].isupper():
+                r["genus"], r["species"] = parts[0], f"{parts[0]} {parts[1]}"
+            else:
+                r["species"] = raw
+        if not r["family"] and r["genus"]:
+            r["family"] = GENUS_FAMILY.get(r["genus"], "")
+        self._tax_work.append(r)
+        self._reload_species_list()
 
     def _sp_remove(self):
-        cat = self.sp_cat.currentText()
         for it in self.sp_list.selectedItems():
-            try:
-                self._sp_work[cat].remove(it.text())
-            except (KeyError, ValueError):
-                pass
+            i = self.sp_list.row(it)
+            if 0 <= i < len(self._tax_visible):
+                target = self._tax_visible[i]
+                try:
+                    self._tax_work.remove(target)
+                except ValueError:
+                    pass
         self._reload_species_list()
 
     def _sp_import(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Import species CSV", "", "CSV (*.csv)")
+        p, _ = QFileDialog.getOpenFileName(self, "Import taxonomy CSV", "", "CSV (*.csv)")
         if not p:
             return
         try:
-            import_species_csv(p, replace=True)
+            import_taxonomy_csv(p, replace=True)
             load_all_label_config()
-            self._sp_work = {c: list(v) for c, v in SPECIES_CATEGORIES.items()}
+            self._tax_work = [dict(r) for r in TAXONOMY.rows]
             self.sp_cat.blockSignals(True)
             self.sp_cat.clear()
             self.sp_cat.addItems(SPECIES_CATEGORY_ORDER)
             self.sp_cat.blockSignals(False)
             self._reload_species_list()
-            QMessageBox.information(self, "Imported", f"Imported species from:\n{p}")
+            QMessageBox.information(self, "Imported", f"Imported taxonomy from:\n{p}")
         except Exception as e:
             QMessageBox.critical(self, "Import failed", str(e))
 
     def _sp_restore(self):
-        restore_default("species")
+        restore_default("taxonomy")
         load_all_label_config()
-        self._sp_work = {c: list(v) for c, v in SPECIES_CATEGORIES.items()}
+        self._tax_work = [dict(r) for r in TAXONOMY.rows]
         self._reload_species_list()
 
     def _commit(self):
         write_behaviors_csv(self.mov.values(), self.soc.values())
         write_habitats_csv(self.hab.values())
-        write_species_csv(self._sp_work)
+        write_taxonomy_csv(self._tax_work)
         load_all_label_config()
         self.accept()
 
@@ -2097,10 +2905,18 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.setInterval(max(1, int(1000 / self.fps)))
 
-        # autosave timer (sidecar JSON next to the source)
+        # autosave: a periodic safety net PLUS a short debounce that fires
+        # after any change, so no more than a couple of seconds of work is
+        # ever at risk.
+        self._dirty = False
+        self._dirty_delay_ms = 2000
         self.autosave_timer = QTimer(self)
-        self.autosave_timer.timeout.connect(self._autosave)
-        self.autosave_timer.start(60_000)  # every 60s
+        self.autosave_timer.timeout.connect(lambda: self._autosave("timer"))
+        self.autosave_timer.start(60_000)  # periodic backstop
+
+        self._dirty_timer = QTimer(self)
+        self._dirty_timer.setSingleShot(True)
+        self._dirty_timer.timeout.connect(lambda: self._autosave("change"))
 
         self._build_ui()
         self.seek_to(0)
@@ -2120,9 +2936,6 @@ class MainWindow(QMainWindow):
         given, a trailing "＋" button invokes it.
         """
         container = QWidget()
-        outer = QVBoxLayout()
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(4)
 
         try:
             from PyQt6.QtWidgets import QButtonGroup
@@ -2133,14 +2946,15 @@ class MainWindow(QMainWindow):
         group.setExclusive(True)
         btns: Dict[str, QToolButton] = {}
 
-        hl = QHBoxLayout()
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(6)
+        # FlowLayout (not QHBoxLayout) so the bar wraps instead of forcing the
+        # whole window wider than the screen on small laptops.
+        fl = FlowLayout(margin=0, spacing=5)
         lab = QLabel(title)
         lab.setObjectName("BarTitle")
-        hl.addWidget(lab)
+        lab.setMinimumWidth(66)
+        fl.addWidget(lab)
 
-        def _add_option_button(opt):
+        def _make_btn(opt):
             b = QToolButton()
             b.setText(opt)
             b.setCheckable(True)
@@ -2148,22 +2962,16 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda checked, t=opt: on_select(t))
             group.addButton(b)
             btns[opt] = b
-            # insert before the trailing stretch (+ optional add button)
-            insert_at = hl.count() - 1 - (1 if on_add is not None else 0)
-            hl.insertWidget(max(1, insert_at), b)
+            return b
+
+        def _add_option_button(opt):
+            b = _make_btn(opt)
+            # keep new options ahead of the trailing "＋" button
+            fl.insertWidget(fl.count() - (1 if on_add is not None else 0), b)
             return b
 
         for opt in options:
-            b = QToolButton()
-            b.setText(opt)
-            b.setCheckable(True)
-            b.setProperty("segmented", True)
-            b.clicked.connect(lambda checked, t=opt: on_select(t))
-            group.addButton(b)
-            btns[opt] = b
-            hl.addWidget(b)
-
-        hl.addStretch(1)
+            fl.addWidget(_make_btn(opt))
 
         if on_add is not None:
             add_btn = QToolButton()
@@ -2171,9 +2979,18 @@ class MainWindow(QMainWindow):
             add_btn.setProperty("segmented", True)
             add_btn.setToolTip("Add a new option")
             add_btn.clicked.connect(lambda: on_add())
-            hl.addWidget(add_btn)
+            fl.addWidget(add_btn)
 
-        container.setLayout(hl)
+        container.setLayout(fl)
+        # A heightForWidth layout is only honoured if the *size policy* also
+        # declares it — without this the parent layout ignores the wrapped
+        # height and the bars overlap each other.
+        try:
+            sp = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        except AttributeError:
+            sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        sp.setHeightForWidth(True)
+        container.setSizePolicy(sp)
         return container, btns, _add_option_button
 
     def _build_ui(self):
@@ -2184,7 +3001,7 @@ class MainWindow(QMainWindow):
         self.video_label = VideoLabel()
         align_flag = Qt.AlignmentFlag.AlignCenter if _QT6 else Qt.AlignCenter
         self.video_label.setAlignment(align_flag)
-        self.video_label.setMinimumSize(QSize(640, 400))
+        self.video_label.setMinimumSize(QSize(360, 240))
         try:
             _exp = QSizePolicy.Policy.Expanding
         except AttributeError:
@@ -2217,14 +3034,34 @@ class MainWindow(QMainWindow):
         self._habitat_btns[self._current_habitat].setChecked(True)
         self._visibility_btns[self._current_visibility].setChecked(True)
 
+        # The four label bars live in their own height-capped scroll area. They
+        # wrap on narrow windows, and capping the height means however much they
+        # wrap they can never force the whole window taller than the screen.
+        bars_host = QWidget()
+        bars_col = QVBoxLayout(bars_host)
+        bars_col.setSpacing(3)
+        bars_col.setContentsMargins(0, 0, 0, 0)
+        for bar in (self.movement_bar, self.social_bar,
+                    self.habitat_bar, self.visibility_bar):
+            bars_col.addWidget(bar)
+        bars_col.addStretch(0)   # soak up slack instead of stretching the bars
+        self._bars_col = bars_col
+
+        bars_scroll = QScrollArea()
+        bars_scroll.setWidget(bars_host)
+        bars_scroll.setWidgetResizable(True)
+        bars_scroll.setFrameShape(QFrame.Shape.NoFrame if _QT6 else QFrame.NoFrame)
+        hoff = (Qt.ScrollBarPolicy.ScrollBarAlwaysOff if _QT6 else Qt.ScrollBarAlwaysOff)
+        bars_scroll.setHorizontalScrollBarPolicy(hoff)
+        bars_scroll.setMaximumHeight(190)
+        bars_scroll.setMinimumHeight(96)
+        self._bars_scroll = bars_scroll
+
         video_col = QVBoxLayout()
-        video_col.setSpacing(2)
+        video_col.setSpacing(4)
         video_col.setContentsMargins(0, 0, 0, 0)
         video_col.addWidget(self.video_label, stretch=1)
-        video_col.addWidget(self.movement_bar)
-        video_col.addWidget(self.social_bar)
-        video_col.addWidget(self.habitat_bar)
-        video_col.addWidget(self.visibility_bar)
+        video_col.addWidget(bars_scroll)
         self._video_col = video_col
 
         video_wrap = QWidget()
@@ -2300,31 +3137,11 @@ class MainWindow(QMainWindow):
         category_row.addWidget(QLabel("Category:"))
         category_row.addWidget(self.category_combo, stretch=1)
 
-        # Species combo (editable with autocomplete) + "add species" button
-        self.species_combo = _shrinkable(QComboBox(), chars=14)
-        self.species_combo.setEditable(True)
-        self.species_combo.addItem("")
-        self.species_combo.addItems(SPECIES_CATEGORIES.get(first_cat, []))
-        completer = QCompleter(SPECIES_CATEGORIES.get(first_cat, ALL_SPECIES))
-        try:
-            completer.setFilterMode(Qt.MatchFlag.MatchContains)
-            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        except AttributeError:
-            completer.setFilterMode(Qt.MatchContains)
-            completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.species_combo.setCompleter(completer)
+        # Taxonomy picker: find-box + Family/Genus/Species, so an annotator can
+        # stop at whatever rank they're confident about.
+        self.taxon = TaxonomyPicker()
+        self.taxon.set_category(first_cat)
         self.category_combo.currentTextChanged.connect(self._on_category_changed)
-
-        self.add_species_btn = QToolButton()
-        self.add_species_btn.setText("＋")
-        self.add_species_btn.setProperty("segmented", True)
-        self.add_species_btn.setToolTip("Add a new species to the current category")
-        self.add_species_btn.clicked.connect(self._add_species_dialog)
-
-        species_row = QHBoxLayout()
-        species_row.addWidget(QLabel("Species:"))
-        species_row.addWidget(self.species_combo, stretch=1)
-        species_row.addWidget(self.add_species_btn)
 
         # Count spinbox + confidence.  (No sex fields here — conspecific sharks
         # are logged on the Social bar, not as fish-ID annotations.)
@@ -2420,7 +3237,7 @@ class MainWindow(QMainWindow):
         # Pack into a "card"
         card_layout = QVBoxLayout()
         card_layout.addLayout(category_row)
-        card_layout.addLayout(species_row)
+        card_layout.addWidget(self.taxon)
         card_layout.addLayout(count_row)
         card_layout.addLayout(name_row)
         card_layout.addWidget(self.bbox_btn)
@@ -2472,7 +3289,7 @@ class MainWindow(QMainWindow):
                     else Qt.ScrollBarAlwaysOff)
         rw.setHorizontalScrollBarPolicy(hbar_off)
         rw.setMaximumWidth(400)
-        rw.setMinimumWidth(360)
+        rw.setMinimumWidth(290)
 
         # ---- playback controls ----
         self.play_btn = QPushButton("Play")
@@ -2489,6 +3306,7 @@ class MainWindow(QMainWindow):
 
         self.frame_lbl = QLabel()
         self.frame_lbl.setObjectName("Subtle")
+        self.frame_lbl.setMinimumWidth(150)
 
         # Speed combo
         self.speed_combo = QComboBox()
@@ -2537,25 +3355,26 @@ class MainWindow(QMainWindow):
 
         # Playlist switcher (multiple videos / folder loading)
         self.video_combo = QComboBox()
-        self.video_combo.setMinimumWidth(140)
+        self.video_combo.setMinimumWidth(110)
         self.video_combo.currentIndexChanged.connect(self._on_playlist_changed)
 
-        ctrls = QHBoxLayout()
-        ctrls.setSpacing(8)
-        ctrls.addWidget(self.back_btn)
-        ctrls.addWidget(self.play_btn)
-        ctrls.addWidget(self.fwd_btn)
-        ctrls.addWidget(self.frame_lbl)
-        ctrls.addStretch(1)
-        ctrls.addWidget(self.video_combo)
-        ctrls.addWidget(zoom_out_btn)
-        ctrls.addWidget(self.zoom_lbl)
-        ctrls.addWidget(zoom_in_btn)
-        ctrls.addWidget(zoom_reset_btn)
-        ctrls.addWidget(self.label_mode_btn)
-        ctrls.addLayout(axis_row)
-        ctrls.addWidget(QLabel("Speed:"))
-        ctrls.addWidget(self.speed_combo)
+        # Bottom control strip also uses FlowLayout: on a narrow window it wraps
+        # to a second row instead of forcing the window wider than the display.
+        axis_host = QWidget()
+        axis_host.setLayout(axis_row)
+
+        speed_host = QWidget()
+        speed_hl = QHBoxLayout(speed_host)
+        speed_hl.setContentsMargins(0, 0, 0, 0)
+        speed_hl.setSpacing(4)
+        speed_hl.addWidget(QLabel("Speed:"))
+        speed_hl.addWidget(self.speed_combo)
+
+        ctrls = FlowLayout(margin=0, spacing=7)
+        for w in (self.back_btn, self.play_btn, self.fwd_btn, self.frame_lbl,
+                  self.video_combo, zoom_out_btn, self.zoom_lbl, zoom_in_btn,
+                  zoom_reset_btn, self.label_mode_btn, axis_host, speed_host):
+            ctrls.addWidget(w)
 
         # ---- bottom timeline scrubber ----
         self.timeline = AnnotationTimeline(self.store, self.fps, self.total_frames)
@@ -2673,7 +3492,7 @@ class MainWindow(QMainWindow):
             return
 
         species_category = self.category_combo.currentText() or "Other"
-        species = self.species_combo.currentText().strip()
+        tax = self.taxon.value()
         confidence = self.confidence_combo.currentText().strip()
         count = self.count_spin.value()
         name = (self.name_edit.text() or "").strip()
@@ -2693,7 +3512,10 @@ class MainWindow(QMainWindow):
             init_coords=[x1, y1, x2, y2],
             count=count,
             species_category=species_category,
-            species=species,
+            species=tax["species"],
+            family=tax["family"],
+            genus=tax["genus"],
+            common=tax["common"],
             confidence=confidence,
         )
         self.store.add_feature(feat, {}, {fidx: (x1, y1, x2, y2)})
@@ -2809,34 +3631,6 @@ class MainWindow(QMainWindow):
         (self._on_movement_selected if axis == "movement"
          else self._on_social_selected)(label)
 
-    def _add_species_dialog(self):
-        """Prompt for a new species under the current category; persist to CSV."""
-        try:
-            from PyQt6.QtWidgets import QInputDialog
-        except ImportError:
-            from PyQt5.QtWidgets import QInputDialog
-        category = self.category_combo.currentText() or "Other"
-        text, ok = QInputDialog.getText(
-            self, "Add species", f"New species name (category: {category}):")
-        if not ok:
-            return
-        name = (text or "").strip()
-        if not name:
-            return
-        SPECIES_CATEGORIES.setdefault(category, [])
-        if name not in SPECIES_CATEGORIES[category]:
-            SPECIES_CATEGORIES[category].append(name)
-            ALL_SPECIES.append(name)
-            append_species_to_csv(category, name)
-        # refresh the combo for the current category and select the new species
-        self._on_category_changed(category)
-        i = self.species_combo.findText(name)
-        if i >= 0:
-            self.species_combo.setCurrentIndex(i)
-        else:
-            self.species_combo.setEditText(name)
-        self.statusBar().showMessage(f"Added species '{name}' to {category}.")
-
     def _add_habitat_dialog(self):
         text, ok = QInputDialog.getText(self, "Add habitat", "New habitat:")
         if not ok:
@@ -2870,7 +3664,7 @@ class MainWindow(QMainWindow):
         # detach the shark logger so deleting the old social bar can't kill it
         self._shark_logger.setParent(None)
         for bar in (self.movement_bar, self.social_bar, self.habitat_bar):
-            self._video_col.removeWidget(bar)
+            self._bars_col.removeWidget(bar)
             bar.setParent(None)
             bar.deleteLater()
         self.movement_bar, self._movement_btns, self._movement_append = \
@@ -2886,9 +3680,9 @@ class MainWindow(QMainWindow):
                                    self._on_habitat_selected,
                                    on_add=self._add_habitat_dialog)
         self.social_bar.layout().addWidget(self._shark_logger)  # re-attach
-        self._video_col.insertWidget(1, self.movement_bar)
-        self._video_col.insertWidget(2, self.social_bar)
-        self._video_col.insertWidget(3, self.habitat_bar)
+        self._bars_col.insertWidget(0, self.movement_bar)
+        self._bars_col.insertWidget(1, self.social_bar)
+        self._bars_col.insertWidget(2, self.habitat_bar)
         # keep valid current selections, else fall back to first option
         self._current_movement = cur[0] if cur[0] in MOVEMENT_OPTIONS else MOVEMENT_OPTIONS[0]
         self._current_social = cur[1] if cur[1] in SOCIAL_OPTIONS else SOCIAL_OPTIONS[0]
@@ -3093,29 +3887,19 @@ class MainWindow(QMainWindow):
             self.seek_to(int(note["frame"]))
 
     def _on_video_note_changed(self):
-        self.store.video_note = (self.video_note_edit.text() or "").strip()
+        new = (self.video_note_edit.text() or "").strip()
+        if new != self.store.video_note:
+            self.store.video_note = new
+            self._mark_dirty()
 
     def _sync_video_note(self):
         if hasattr(self, "video_note_edit"):
             self.video_note_edit.setText(self.store.video_note or "")
 
     def _on_category_changed(self, category: str):
-        self.species_combo.clear()
-        self.species_combo.addItem("")  # blank = no species selected
-        species_list = SPECIES_CATEGORIES.get(category, [])
-        if not species_list:
-            self.species_combo.addItems(ALL_SPECIES)
-        else:
-            self.species_combo.addItems(species_list)
-        # reset completer
-        completer = QCompleter(SPECIES_CATEGORIES.get(category, ALL_SPECIES))
-        try:
-            completer.setFilterMode(Qt.MatchFlag.MatchContains)
-            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        except AttributeError:
-            completer.setFilterMode(Qt.MatchContains)
-            completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.species_combo.setCompleter(completer)
+        """Narrow the taxonomy picker to the chosen animal category."""
+        if hasattr(self, "taxon"):
+            self.taxon.set_category(category)
 
     def _ensure_scene_labels(self, idx: int):
         stored_mov = self.store.movement_per_frame[idx]
@@ -3151,8 +3935,9 @@ class MainWindow(QMainWindow):
         for i, feat in enumerate(self.store.features):
             c = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)]
             label = feat.species_category
-            if feat.species:
-                label = f"{feat.species_category}: {feat.species}"
+            _idl = feat.id_label()
+            if _idl and _idl != feat.species_category:
+                label = f"{feat.species_category}: {_idl}"
             extra = ""
             summary = feat.sex_summary()
             if summary:
@@ -3212,11 +3997,7 @@ class MainWindow(QMainWindow):
         if cat_idx >= 0:
             self.category_combo.setCurrentIndex(cat_idx)
         # Set species combo (after category filter is applied)
-        sp_idx = self.species_combo.findText(feat.species)
-        if sp_idx >= 0:
-            self.species_combo.setCurrentIndex(sp_idx)
-        else:
-            self.species_combo.setEditText(feat.species)
+        self.taxon.set_value(feat.family, feat.genus, feat.species, feat.common)
 
     def _update_feature(self):
         """Save name/species/count changes back to the selected feature."""
@@ -3233,7 +4014,11 @@ class MainWindow(QMainWindow):
         if name:
             feat.name = name
         feat.species_category = self.category_combo.currentText()
-        feat.species = self.species_combo.currentText().strip()
+        _tax = self.taxon.value()
+        feat.species = _tax["species"]
+        feat.family = _tax["family"]
+        feat.genus = _tax["genus"]
+        feat.common = _tax["common"]
         feat.confidence = self.confidence_combo.currentText().strip()
         feat.count = self.count_spin.value()
         self._refresh_features()
@@ -3291,6 +4076,8 @@ class MainWindow(QMainWindow):
             self.store.set_habitat(f, self._current_habitat)
         if ax.get("visibility", True):
             self.store.set_visibility(f, self._current_visibility)
+        # labeling during playback/scrub doesn't go through _push_undo
+        self._mark_dirty()
 
     def _on_slider_seek(self, idx: int):
         if self._labeling and idx > self.current_frame_idx:
@@ -3320,11 +4107,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "timeline"):
             self.timeline.set_current_frame(idx)
 
-        self.frame_lbl.setText(
-            f"Frame {idx}/{self.total_frames - 1} • {self._current_movement}"
-            f" + {self._current_social} • {self._current_habitat}"
-            f" • vis: {self._current_visibility}"
-        )
+        # Keep this compact — it sits in the bottom control strip, and a long
+        # string here used to force the whole window wider than small screens.
+        full = (f"Frame {idx}/{self.total_frames - 1} • {self._current_movement}"
+                f" + {self._current_social} • {self._current_habitat}"
+                f" • vis: {self._current_visibility}")
+        self.frame_lbl.setText(f"Frame {idx}/{self.total_frames - 1}")
+        self.frame_lbl.setToolTip(full)
 
     # -------------------------------------------------------------- display
     def _read_frame(self, idx):
@@ -3390,8 +4179,9 @@ class MainWindow(QMainWindow):
     def _feature_label(feat) -> str:
         """Compose the on-frame label for a feature (species, sex, count, conf)."""
         lbl = feat.species_category
-        if feat.species:
-            lbl = f"{feat.species_category}: {feat.species}"
+        _idl = feat.id_label()
+        if _idl and _idl != feat.species_category:
+            lbl = f"{feat.species_category}: {_idl}"
         summary = feat.sex_summary()
         if summary:
             lbl = f"{lbl} [{summary}]"
@@ -3615,6 +4405,9 @@ class MainWindow(QMainWindow):
         self._undo_stack.append(self._snapshot())
         if len(self._undo_stack) > self._undo_limit:
             self._undo_stack.pop(0)
+        # every discrete mutating action calls _push_undo first, so this is the
+        # single choke point that marks the session dirty
+        self._mark_dirty()
 
     def _undo(self):
         if not self._undo_stack:
@@ -3643,6 +4436,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "timeline"):
             self.timeline.update()
         self._display_frame(self.current_frame_idx)
+        self._mark_dirty()   # undo is itself a change that must be persisted
         self.statusBar().showMessage("Undo.")
 
     # ------------------------------------------------------- clips
@@ -3824,8 +4618,16 @@ class MainWindow(QMainWindow):
             return False, str(e)
 
     def _has_annotations(self) -> bool:
+        """True if the store holds ANY annotation worth persisting.
+
+        Must cover every kind of user work — missing one here means that work
+        silently never autosaves (this previously omitted shark_log and
+        video_note, so shark-only sessions saved nothing).
+        """
         s = self.store
-        if s.features or s.notes or s.clips:
+        if s.features or s.notes or s.clips or s.shark_log:
+            return True
+        if (s.video_note or "").strip():
             return True
         for tl in (s.movement_per_frame, s.social_per_frame,
                    s.habitat_per_frame, s.visibility_per_frame):
@@ -3833,14 +4635,27 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
-    def _autosave(self):
+    def _mark_dirty(self):
+        """Record that something changed and schedule a prompt autosave.
+
+        Called from every mutating action, so work is persisted within a couple
+        of seconds of any edit rather than only on the 60 s tick / on close.
+        """
+        self._dirty = True
+        if hasattr(self, "_dirty_timer"):
+            self._dirty_timer.start(self._dirty_delay_ms)  # restart = debounce
+
+    def _autosave(self, reason="timer"):
+        if hasattr(self, "_dirty_timer"):
+            self._dirty_timer.stop()
         if not self._has_annotations():
             return
         ok, err = self._safe_save(self._autosave_path())
         if ok:
+            self._dirty = False
             self.statusBar().showMessage("Autosaved (local).", 2000)
         else:
-            self.statusBar().showMessage(f"Autosave failed: {err}", 4000)
+            self.statusBar().showMessage(f"Autosave failed: {err}", 6000)
 
     def _apply_loaded_store(self, loaded: "FeatureStore"):
         """Merge a loaded store's annotations into the current store."""
@@ -4110,7 +4925,6 @@ class MainWindow(QMainWindow):
             "Mud":          "#78644A",
         }
         VIS_COLORS = {
-            "Very bad":  "#BE123C",
             "Bad":       "#EF4444",
             "Fine":      "#F59E0B",
             "Good":      "#22C55E",
@@ -4202,7 +5016,7 @@ class MainWindow(QMainWindow):
         species_counts = Counter()
         cat_for_species = {}
         for feat in store.features:
-            sp = feat.species or feat.species_category or "Unknown"
+            sp = feat.id_label() or "Unknown"
             species_counts[sp] += feat.count
             cat_for_species[sp] = feat.species_category or "Other"
 
@@ -4222,7 +5036,7 @@ class MainWindow(QMainWindow):
                 c, cat = Counter(), {}
                 for feat in store.features:
                     if _feat_habitat(feat) == hab:
-                        sp = feat.species or feat.species_category or "Unknown"
+                        sp = feat.id_label() or "Unknown"
                         c[sp]   += feat.count
                         cat[sp]  = feat.species_category or "Other"
                 sp_hab_counts[hab] = c
@@ -4452,7 +5266,7 @@ class MainWindow(QMainWindow):
                 cat_in_hab = {}
                 for feat in store.features:
                     if _feat_habitat(feat) == hab:
-                        sp = feat.species or feat.species_category or "Unknown"
+                        sp = feat.id_label() or "Unknown"
                         sp_in_hab[sp] += feat.count
                         cat_in_hab[sp] = feat.species_category or "Other"
                 if sp_in_hab:
@@ -4635,7 +5449,7 @@ class MainWindow(QMainWindow):
             for sp_name in sorted(species_counts):
                 sp_arr = np.zeros(total, dtype=float)
                 for feat in store.features:
-                    key = feat.species or feat.species_category or "Unknown"
+                    key = feat.id_label() or "Unknown"
                     if key == sp_name and 0 <= feat.init_frame < total:
                         sp_arr[feat.init_frame] += feat.count
                 if not sp_arr.any():
@@ -4803,7 +5617,8 @@ class MainWindow(QMainWindow):
         # ── Sheet 1: Sightings flat table ─────────────────────────
         ws1 = wb.active
         ws1.title = "Sightings"
-        _hrow(ws1, ["Frame", "Time", "Name", "Category", "Species",
+        _hrow(ws1, ["Frame", "Time", "Name", "Category",
+                    "Family", "Genus", "Species", "Common Name", "ID Level",
                     "Count", "Males", "Females", "Unknown Sex", "Confidence",
                     "Movement", "Social", "Habitat", "Visibility"])
         ws1.freeze_panes = "A2"
@@ -4817,7 +5632,11 @@ class MainWindow(QMainWindow):
             for c, v in enumerate([
                 fi, _t(fi), feat.name,
                 feat.species_category or "",
+                feat.family or "",
+                feat.genus or "",
                 feat.species or "",
+                feat.common or "",
+                feat.id_level() or "",
                 feat.count,
                 n_m, n_f, n_u,
                 feat.confidence or "",
@@ -4838,7 +5657,7 @@ class MainWindow(QMainWindow):
         sp_counts = Counter()
         sp_cats   = {}
         for feat in store.features:
-            sp = feat.species or feat.species_category or "Unknown"
+            sp = feat.id_label() or "Unknown"
             sp_counts[sp] += feat.count
             sp_cats[sp]    = feat.species_category or "Other"
         sp_list = sorted(sp_counts, key=lambda s: sp_counts[s], reverse=True)
@@ -5064,8 +5883,11 @@ class MainWindow(QMainWindow):
             "  • Draw Bbox (or B), then click TWO corners (right-click cancels).\n"
             "  • Click a box on the video to select it; drag its corners to edit;\n"
             "    Delete removes it.\n"
-            "  • Species dropdown includes family names — pick a family when you\n"
-            "    can't ID to species.\n\n"
+            "  • Identify at whatever rank you're sure of: type into Find (or\n"
+            "    straight into Species) and Family/Genus back-fill themselves;\n"
+            "    or fill only Family (or only Genus) and stop there. The panel\n"
+            "    shows which level was recorded. Picking a Family narrows the\n"
+            "    Genus and Species lists for browsing.\n\n"
             "COMMENTS & CLIPS\n"
             "  • Add a comment at any frame ('ID this fish later'); rose markers\n"
             "    show them on the timeline. Plus a whole-video note field.\n"
@@ -5084,6 +5906,8 @@ class MainWindow(QMainWindow):
             pass
         if hasattr(self, "autosave_timer"):
             self.autosave_timer.stop()
+        if hasattr(self, "_dirty_timer"):
+            self._dirty_timer.stop()
         if self.cap is not None:
             self.cap.release()
         if self.temp_dir and os.path.isdir(self.temp_dir):
@@ -5277,7 +6101,20 @@ def main():
     win._playlist = [chosen]
     win._refresh_playlist()
     win._start_preload_next()
-    win.resize(1360, 900)
+
+    # Size to the screen actually in use rather than a fixed 1360x900, which
+    # overflowed smaller laptop displays and pushed the control panel off-screen.
+    screen = app.primaryScreen()
+    avail = screen.availableGeometry() if screen else None
+    if avail is not None:
+        w = max(900, min(1360, int(avail.width() * 0.92)))
+        h = max(600, min(900, int(avail.height() * 0.92)))
+        win.resize(w, h)
+        frame = win.frameGeometry()
+        frame.moveCenter(avail.center())
+        win.move(frame.topLeft())
+    else:
+        win.resize(1200, 800)
     win.show()
     sys.exit(app.exec())
 
