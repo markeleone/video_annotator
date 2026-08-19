@@ -85,8 +85,13 @@ SOCIAL_OPTIONS_DEFAULT = [
     "Following a shark",
     "Shark following tagged",
     "Brief interaction",
-    "With 1+ sharks",
 ]
+
+# Labels retired from the pickers. They are removed from the button bars (and
+# from an existing behaviors.csv) but NEVER stripped from saved annotations —
+# older deployments legitimately used them, so the data stays intact and the
+# timeline/plots still render those segments.
+RETIRED_SOCIAL = {"With 1+ sharks"}   # superseded by the Social-bar shark log
 
 # Runtime lists (populated from CSV in main(); fall back to the defaults).
 MOVEMENT_OPTIONS = list(MOVEMENT_OPTIONS_DEFAULT)
@@ -470,6 +475,41 @@ _CLOUD_PATH_MARKERS = (
 )
 
 
+VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv")
+
+
+def source_key_for(path: str) -> str:
+    """Stable, filesystem-safe id for a source path (shared by autosave and the
+    startup folder scan, so both agree on which video an autosave belongs to)."""
+    base = path or "session"
+    stem = os.path.splitext(os.path.basename(base.rstrip("/")))[0] or "session"
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem)[:60]
+    h = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:8]
+    return f"{stem}_{h}"
+
+
+def autosave_path_for(path: str) -> str:
+    return os.path.join(LOCAL_ANNOTATIONS_DIR, source_key_for(path) + ".autosave.json")
+
+
+def is_annotated(path: str) -> bool:
+    """True if this video already has saved annotation work."""
+    p = autosave_path_for(path)
+    try:
+        return os.path.exists(p) and os.path.getsize(p) > 0
+    except OSError:
+        return False
+
+
+def list_videos_in_folder(folder: str):
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in names
+            if n.lower().endswith(VIDEO_EXTS) and not n.startswith("._")]
+
+
 def is_cloud_path(path: str) -> bool:
     """True if `path` appears to live inside a cloud-synced virtual filesystem."""
     return any(m in (path or "") for m in _CLOUD_PATH_MARKERS)
@@ -756,6 +796,7 @@ def load_behaviors_config():
     except (OSError, csv.Error):
         return list(MOVEMENT_OPTIONS_DEFAULT), list(SOCIAL_OPTIONS_DEFAULT)
 
+    social = [s for s in social if s not in RETIRED_SOCIAL]
     return (movement or list(MOVEMENT_OPTIONS_DEFAULT),
             social or list(SOCIAL_OPTIONS_DEFAULT))
 
@@ -1689,6 +1730,27 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + m.bottom()
 
 
+class FlowBar(QWidget):
+    """Container for a FlowLayout that reports the height its content actually
+    needs at the width it was given.
+
+    Qt does not reliably push a parent's width down into a child's
+    heightForWidth, so a wrapping bar nested in a column would otherwise be
+    laid out at its minimum width and claim far more height than it needs.
+    Recomputing on resize keeps the bars exactly as tall as their rows.
+    """
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        lay = self.layout()
+        if lay is None:
+            return
+        h = lay.heightForWidth(self.width())
+        if h > 0 and h != self.minimumHeight():
+            self.setMinimumHeight(h)
+            self.setMaximumHeight(h)
+
+
 class VideoLabel(QLabel):
     pointClicked = pyqtSignal(object)           # QPoint — click on empty area
     bboxDrawn = pyqtSignal(object, object)      # two-click: start,end (label coords)
@@ -1921,6 +1983,11 @@ class AnnotationTimeline(QWidget):
             opt: QColor(*FEATURE_COLORS[(i + 3) % len(FEATURE_COLORS)])
             for i, opt in enumerate(SOCIAL_OPTIONS)
         }
+        # retired labels keep a colour so older annotations still render
+        for j, opt in enumerate(sorted(RETIRED_SOCIAL)):
+            self._social_colors.setdefault(
+                opt, QColor(*FEATURE_COLORS[(len(SOCIAL_OPTIONS) + j + 3)
+                                            % len(FEATURE_COLORS)]))
         self._social_colors[None] = QColor(203, 213, 225)
 
         # Colors for habitat segments — known habitats get fixed colors, any
@@ -2247,6 +2314,162 @@ class AnnotationTimeline(QWidget):
         else:
             p.drawText(cx - 14 - cur_w, ty, cur_t)  # left of knob near the end
         fb.setBold(False); p.setFont(fb)
+
+
+# --------------------------------------------------------------------------
+# Startup chooser — pick a single video or a whole folder, with progress
+# --------------------------------------------------------------------------
+
+RECENT_JSON = os.path.join(CONFIG_DIR, "recent.json")
+
+
+def load_recent():
+    try:
+        with open(RECENT_JSON) as f:
+            data = json.load(f)
+        return [d for d in data.get("folders", []) if os.path.isdir(d)][:5]
+    except (OSError, ValueError):
+        return []
+
+
+def remember_recent(folder):
+    if not folder or not os.path.isdir(folder):
+        return
+    items = [folder] + [f for f in load_recent() if f != folder]
+    try:
+        _ensure_config_dir()
+        with open(RECENT_JSON, "w") as f:
+            json.dump({"folders": items[:5]}, f, indent=2)
+    except OSError:
+        pass
+
+
+class StartupDialog(QDialog):
+    """Asks what to work on instead of dumping the user straight into a file
+    picker. Folder mode scans for existing annotations so work resumes at the
+    first unannotated clip rather than replaying finished ones."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CTAG Annotator")
+        self.result_choice = None      # ("video"|"frames"|"folder", path)
+        self.setMinimumWidth(520)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(22, 20, 22, 18)
+        v.setSpacing(12)
+
+        title = QLabel("What would you like to annotate?")
+        title.setObjectName("Title")
+        v.addWidget(title)
+
+        sub = QLabel("Open a whole deployment folder to work through it clip by "
+                     "clip — already-annotated videos are detected so you pick "
+                     "up where you left off.")
+        sub.setObjectName("Subtle")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+
+        folder_btn = QPushButton("Open a folder of videos…")
+        folder_btn.clicked.connect(self._pick_folder)
+        v.addWidget(folder_btn)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        one_btn = QPushButton("Open a single video…")
+        one_btn.setObjectName("Secondary")
+        one_btn.clicked.connect(self._pick_video)
+        frames_btn = QPushButton("Open a frames folder…")
+        frames_btn.setObjectName("Secondary")
+        frames_btn.clicked.connect(self._pick_frames)
+        row.addWidget(one_btn)
+        row.addWidget(frames_btn)
+        v.addLayout(row)
+
+        recents = load_recent()
+        if recents:
+            lbl = QLabel("Recent folders")
+            lbl.setObjectName("BarTitle")
+            v.addWidget(lbl)
+            self.recent_list = QListWidget()
+            self.recent_list.setMaximumHeight(112)
+            for folder in recents:
+                vids = list_videos_in_folder(folder)
+                done = sum(1 for p in vids if is_annotated(p))
+                it = QListWidgetItem(
+                    f"{os.path.basename(folder.rstrip('/'))}   —   "
+                    f"{done}/{len(vids)} annotated")
+                it.setToolTip(folder)
+                it.setData(Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole, folder)
+                self.recent_list.addItem(it)
+            self.recent_list.itemDoubleClicked.connect(self._use_recent)
+            v.addWidget(self.recent_list)
+
+        quit_row = QHBoxLayout()
+        quit_row.addStretch(1)
+        q = QPushButton("Quit")
+        q.setObjectName("Secondary")
+        q.clicked.connect(self.reject)
+        quit_row.addWidget(q)
+        v.addLayout(quit_row)
+
+    def _use_recent(self, item):
+        role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        self._accept_folder(item.data(role))
+
+    def _pick_video(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Open video", "", "Video (*.mp4 *.MP4 *.mov *.MOV *.avi *.mkv)")
+        if p:
+            self.result_choice = ("video", p)
+            self.accept()
+
+    def _pick_frames(self):
+        d = QFileDialog.getExistingDirectory(self, "Select a folder of JPEG frames")
+        if d:
+            self.result_choice = ("frames", d)
+            self.accept()
+
+    def _pick_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Select a folder of videos")
+        if d:
+            self._accept_folder(d)
+
+    def _accept_folder(self, d):
+        vids = list_videos_in_folder(d)
+        if not vids:
+            QMessageBox.information(
+                self, "No videos found",
+                f"No video files in:\n{d}\n\n"
+                "If this folder holds extracted JPEG frames, use "
+                "'Open a frames folder…' instead.")
+            return
+        done = [p for p in vids if is_annotated(p)]
+        todo = [p for p in vids if not is_annotated(p)]
+        if done and todo:
+            yes = QMessageBox.StandardButton.Yes if _QT6 else QMessageBox.Yes
+            no = QMessageBox.StandardButton.No if _QT6 else QMessageBox.No
+            ret = QMessageBox.question(
+                self, "Resume this folder?",
+                f"{len(vids)} videos found — {len(done)} already annotated, "
+                f"{len(todo)} still to do.\n\n"
+                f"Start at the first unannotated clip "
+                f"({os.path.basename(todo[0])})?\n\n"
+                "Choosing No starts at the beginning instead. Either way every "
+                "clip stays available in the dropdown.",
+                yes | no)
+            start = todo[0] if ret == yes else vids[0]
+        elif done and not todo:
+            QMessageBox.information(
+                self, "All done",
+                f"All {len(vids)} videos in this folder are already annotated. "
+                "Opening the first one.")
+            start = vids[0]
+        else:
+            start = vids[0]
+        remember_recent(d)
+        self.result_choice = ("folder", (d, vids, start))
+        self.accept()
 
 
 # --------------------------------------------------------------------------
@@ -2968,7 +3191,7 @@ class MainWindow(QMainWindow):
         option button live (used by the in-app "＋ Add" flow).  If on_add is
         given, a trailing "＋" button invokes it.
         """
-        container = QWidget()
+        container = FlowBar()
 
         try:
             from PyQt6.QtWidgets import QButtonGroup
@@ -3080,21 +3303,22 @@ class MainWindow(QMainWindow):
         bars_col.addStretch(0)   # soak up slack instead of stretching the bars
         self._bars_col = bars_col
 
-        bars_scroll = QScrollArea()
-        bars_scroll.setWidget(bars_host)
-        bars_scroll.setWidgetResizable(True)
-        bars_scroll.setFrameShape(QFrame.Shape.NoFrame if _QT6 else QFrame.NoFrame)
-        hoff = (Qt.ScrollBarPolicy.ScrollBarAlwaysOff if _QT6 else Qt.ScrollBarAlwaysOff)
-        bars_scroll.setHorizontalScrollBarPolicy(hoff)
-        bars_scroll.setMaximumHeight(190)
-        bars_scroll.setMinimumHeight(96)
-        self._bars_scroll = bars_scroll
+        # Each FlowBar reports the height its rows actually need at the width
+        # it is given, so the strip sizes itself exactly — no scroll area, no
+        # scrollbar on a row of buttons, and no reserved dead space stealing
+        # room from the video.
+        try:
+            sp = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        except AttributeError:
+            sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        bars_host.setSizePolicy(sp)
+        self._bars_host = bars_host
 
         video_col = QVBoxLayout()
-        video_col.setSpacing(4)
+        video_col.setSpacing(6)
         video_col.setContentsMargins(0, 0, 0, 0)
         video_col.addWidget(self.video_label, stretch=1)
-        video_col.addWidget(bars_scroll)
+        video_col.addWidget(bars_host)
         self._video_col = video_col
 
         video_wrap = QWidget()
@@ -3454,6 +3678,12 @@ class MainWindow(QMainWindow):
         lay.addLayout(ctrls)
         central.setLayout(lay)
 
+        # Qt derives a minimum from the worst-case wrapping of the label bars
+        # (very narrow window -> many rows) and would otherwise refuse to shrink
+        # below ~1100px tall, which is more than a 13" display has. The bars
+        # reflow fine at any size, so state the real floor explicitly.
+        self.setMinimumSize(QSize(660, 540))
+
         self.statusBar().showMessage("Ready.")
         self._refresh_features()
         self._refresh_notes()
@@ -3741,6 +3971,9 @@ class MainWindow(QMainWindow):
         tl._movement_colors[None] = QColor(203, 213, 225)
         tl._social_colors = {opt: QColor(*pal[(i + 3) % len(pal)])
                              for i, opt in enumerate(SOCIAL_OPTIONS)}
+        for j, opt in enumerate(sorted(RETIRED_SOCIAL)):
+            tl._social_colors.setdefault(
+                opt, QColor(*pal[(len(SOCIAL_OPTIONS) + j + 3) % len(pal)]))
         tl._social_colors[None] = QColor(203, 213, 225)
         known = {"Mangrove": QColor(16, 185, 129), "Rocky reef": QColor(14, 165, 233),
                  "Sandy bottom": QColor(245, 158, 11), "Gravel": QColor(156, 163, 175),
@@ -4613,11 +4846,7 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------- autosave
     def _source_key(self) -> str:
         """A filesystem-safe, stable id for the current source (for local autosave)."""
-        base = self.store.video_path or self.video_path or "session"
-        stem = os.path.splitext(os.path.basename(base.rstrip("/")))[0] or "session"
-        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem)[:60]
-        h = hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:8]
-        return f"{stem}_{h}"
+        return source_key_for(self.store.video_path or self.video_path or "session")
 
     def _autosave_path(self) -> str:
         """Autosave always goes to the guaranteed-local annotations folder, so it
@@ -4783,12 +5012,24 @@ class MainWindow(QMainWindow):
         self._switch_source(vids[0], is_frame_dir=False)
 
     def _refresh_playlist(self):
+        """Rebuild the clip dropdown, ticking clips that already have work
+        saved, and select whichever one is currently open."""
         if not hasattr(self, "video_combo"):
             return
+        current = self.store.video_path or self.video_path
         self.video_combo.blockSignals(True)
         self.video_combo.clear()
-        for p in getattr(self, "_playlist", []):
-            self.video_combo.addItem(os.path.basename(p), p)
+        sel = -1
+        for i, p in enumerate(getattr(self, "_playlist", [])):
+            mark = "✓ " if is_annotated(p) else "    "
+            self.video_combo.addItem(mark + os.path.basename(p), p)
+            self.video_combo.setItemData(
+                i, ("Annotated — " if is_annotated(p) else "") + p,
+                Qt.ItemDataRole.ToolTipRole if _QT6 else Qt.ToolTipRole)
+            if p == current:
+                sel = i
+        if sel >= 0:
+            self.video_combo.setCurrentIndex(sel)
         self.video_combo.blockSignals(False)
 
     def _on_playlist_changed(self, i):
@@ -4893,6 +5134,7 @@ class MainWindow(QMainWindow):
         if old_temp and os.path.isdir(old_temp):
             shutil.rmtree(old_temp, ignore_errors=True)
         self._maybe_resume_autosave()
+        self._refresh_playlist()   # keep ✓ marks + selection in sync
         # start silently preparing the next playlist entry
         self._start_preload_next()
 
@@ -6101,15 +6343,22 @@ def main():
 
     chosen = args.video
     is_frame_dir = args.frames_dir
+    playlist = None
 
-    # Resolve the initial source (dialogs if no path given)
+    # No path on the command line → ask what to work on rather than dumping
+    # the user straight into a bare file picker.
     if not chosen:
-        if is_frame_dir:
-            chosen = QFileDialog.getExistingDirectory(None, "Select frames directory")
+        dlg = StartupDialog()
+        if not dlg.exec() or not dlg.result_choice:
+            sys.exit(0)
+        kind, payload = dlg.result_choice
+        if kind == "folder":
+            _folder, playlist, chosen = payload
+            is_frame_dir = False
+        elif kind == "frames":
+            chosen, is_frame_dir = payload, True
         else:
-            chosen, _ = QFileDialog.getOpenFileName(
-                None, "Open video", "",
-                "Video (*.mp4 *.MP4 *.mov *.avi *.mkv)")
+            chosen, is_frame_dir = payload, False
     if not chosen:
         sys.exit(0)
 
@@ -6131,7 +6380,9 @@ def main():
         temp_dir=prep["temp_dir"],
         store_video_path=prep["original"],
     )
-    win._playlist = [chosen]
+    # Whole folder stays in the dropdown (so finished clips remain reachable);
+    # we just start on the clip chosen above and preload the adjacent one.
+    win._playlist = playlist if playlist else [chosen]
     win._refresh_playlist()
     win._start_preload_next()
 
