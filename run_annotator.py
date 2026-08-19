@@ -1093,9 +1093,16 @@ QLineEdit, QComboBox, QDoubleSpinBox {
   padding: 4px 8px;
 }
 
-QComboBox::drop-down {
-  border: none;
-  width: 26px;
+/* NOTE: do NOT restyle QComboBox::drop-down / ::down-arrow here. Qt does not
+   support the CSS border-triangle trick (it paints a solid block), and any
+   drop-down rule without a valid arrow image makes Qt drop the native
+   indicator — which left the boxes looking like plain text fields so nobody
+   realised the lists were browsable. Fusion's own caret is drawn instead. */
+
+/* Roomy, scrollable popup list */
+QComboBox QAbstractItemView::item {
+  min-height: 22px;
+  padding: 3px 6px;
 }
 
 QCheckBox { spacing: 10px; }
@@ -2265,6 +2272,7 @@ class TaxonomyPicker(QWidget):
         self._category = ""
         self._find_map = {}
         self._common = ""
+        self._browsable = []
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -2340,6 +2348,9 @@ class TaxonomyPicker(QWidget):
             completer.setCompletionMode(QCompleter.PopupCompletion)
 
     def _mk_combo(self, placeholder):
+        """An editable combo that is also fully browsable: click the caret (or
+        the empty field) for the whole scrollable list, or type to filter it
+        live — the same feel as a guessing-game country picker."""
         c = QComboBox()
         c.setEditable(True)
         c.setInsertPolicy(QComboBox.InsertPolicy.NoInsert if _QT6
@@ -2350,10 +2361,28 @@ class TaxonomyPicker(QWidget):
         except AttributeError:
             c.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         c.setMinimumContentsLength(10)
-        c.lineEdit().setPlaceholderText(placeholder)
-        c.lineEdit().setClearButtonEnabled(True)
+        c.setMaxVisibleItems(16)          # long, scrollable popup
+        le = c.lineEdit()
+        le.setPlaceholderText(placeholder)
+        le.setClearButtonEnabled(True)
         self._set_contains(c.completer())
+        # clicking into an empty box pops the full list, so browsing is
+        # discoverable without knowing to hit the caret
+        le.installEventFilter(self)
+        self._browsable.append(c)
         return c
+
+    def eventFilter(self, obj, ev):
+        try:
+            is_press = ev.type() == ev.Type.MouseButtonPress
+        except AttributeError:
+            is_press = ev.type() == ev.MouseButtonPress
+        if is_press:
+            for c in self._browsable:
+                if c.lineEdit() is obj and not c.lineEdit().text().strip():
+                    QTimer.singleShot(0, c.showPopup)
+                    break
+        return super().eventFilter(obj, ev)
 
     @staticmethod
     def _fill(combo, items, keep=""):
@@ -2362,6 +2391,10 @@ class TaxonomyPicker(QWidget):
         combo.addItem("")
         combo.addItems(items)
         combo.setCurrentIndex(0)
+        # tell the annotator how much is in here / how far it narrowed
+        base = combo.lineEdit().placeholderText().split("  (")[0]
+        combo.lineEdit().setPlaceholderText(
+            f"{base}  ({len(items)})" if items else base)
         if keep:
             i = combo.findText(keep)
             if i >= 0:
