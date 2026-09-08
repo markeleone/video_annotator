@@ -97,11 +97,10 @@ RETIRED_SOCIAL = {"With 1+ sharks"}   # superseded by the Social-bar shark log
 MOVEMENT_OPTIONS = list(MOVEMENT_OPTIONS_DEFAULT)
 SOCIAL_OPTIONS = list(SOCIAL_OPTIONS_DEFAULT)
 
-# Water visibility — its own persist-until-changed axis (fixed 4-point scale).
-# "Very bad" was removed deliberately: footage that bad isn't worth processing,
-# so it never needs a label. Old files using it migrate to "Bad" on load.
-VISIBILITY_OPTIONS = ["Bad", "Fine", "Good", "Very good"]
-VISIBILITY_LEGACY_MAP = {"Very bad": "Bad", "Poor": "Bad", "Moderate": "Fine"}
+# Water visibility — its own persist-until-changed axis (5-point scale).
+VISIBILITY_OPTIONS = ["Very bad", "Bad", "Fine", "Good", "Very good"]
+# Values from the original 3-point scale still appear in older student files.
+VISIBILITY_LEGACY_MAP = {"Poor": "Bad", "Moderate": "Fine"}
 
 # Per-feature metadata option lists
 CONFIDENCE_OPTIONS = ["", "High", "Medium", "Low"]
@@ -577,6 +576,55 @@ GENUS_FAMILY = {
     "Trachinotus": "Carangidae", "Tylosurus": "Belonidae",
 }
 
+# Plain-English names for the families, so an annotator who knows "groupers"
+# but not "Serranidae" can still find and recognise the right family.
+FAMILY_COMMON = {
+    # Sharks / rays / turtles
+    "Carcharhinidae": "requiem sharks", "Ginglymostomatidae": "nurse sharks",
+    "Dasyatidae": "whiptail stingrays", "Gymnuridae": "butterfly rays",
+    "Mobulidae": "devil rays & mantas", "Myliobatidae": "eagle rays",
+    "Rhinobatidae": "guitarfishes", "Rhinopteridae": "cownose rays",
+    "Urotrygonidae": "round stingrays", "Cheloniidae": "sea turtles",
+    # Teleosts
+    "Acanthuridae": "surgeonfishes", "Apogonidae": "cardinalfishes",
+    "Aulostomidae": "trumpetfishes", "Balistidae": "triggerfishes",
+    "Belonidae": "needlefishes", "Blenniidae": "combtooth blennies",
+    "Bothidae": "lefteye flounders", "Carangidae": "jacks & pompanos",
+    "Centropomidae": "snooks", "Chaenopsidae": "tube blennies",
+    "Chaetodontidae": "butterflyfishes", "Cirrhitidae": "hawkfishes",
+    "Coryphaenidae": "dolphinfishes", "Diodontidae": "porcupinefishes",
+    "Elopidae": "ladyfishes", "Ephippidae": "spadefishes",
+    "Fistulariidae": "cornetfishes", "Gerreidae": "mojarras",
+    "Gobiidae": "gobies", "Haemulidae": "grunts",
+    "Holocentridae": "squirrelfishes", "Kyphosidae": "sea chubs",
+    "Labridae": "wrasses", "Labrisomidae": "labrisomid blennies",
+    "Lutjanidae": "snappers", "Malacanthidae": "tilefishes",
+    "Monacanthidae": "filefishes", "Mugilidae": "mullets",
+    "Mullidae": "goatfishes", "Muraenidae": "moray eels",
+    "Nematistiidae": "roosterfish", "Ophichthidae": "snake eels",
+    "Ostraciidae": "boxfishes", "Pomacanthidae": "angelfishes",
+    "Pomacentridae": "damselfishes", "Scaridae": "parrotfishes",
+    "Scombridae": "mackerels & tunas", "Scorpaenidae": "scorpionfishes",
+    "Serranidae": "groupers & sea basses", "Sparidae": "porgies",
+    "Sphyraenidae": "barracudas", "Syngnathidae": "pipefishes & seahorses",
+    "Synodontidae": "lizardfishes", "Tetraodontidae": "puffers",
+    "Tripterygiidae": "triplefins",
+}
+
+
+def family_display(fam):
+    """'Serranidae' -> 'Serranidae — groupers & sea basses'."""
+    if not fam:
+        return ""
+    common = FAMILY_COMMON.get(fam)
+    return f"{fam} — {common}" if common else fam
+
+
+def family_from_display(text):
+    """Inverse of family_display; tolerant of a bare family name."""
+    return (text or "").split(" — ")[0].strip()
+
+
 _SPECIES_RE = re.compile(r"^(.*?)\s*\(([A-Z][a-z]+)\s+([a-z][a-z\-]*)\)\s*$")
 
 
@@ -698,8 +746,11 @@ class Taxonomy:
                         0 if hay.startswith(q) else 1)
             if gen and q in gen.lower():
                 add("genus", gen, r, 0 if gen.lower().startswith(q) else 1)
-            if fam and q in fam.lower():
-                add("family", fam, r, 0 if fam.lower().startswith(q) else 1)
+            if fam:
+                fam_hay = f"{fam} {FAMILY_COMMON.get(fam, '')}".lower()
+                if q in fam_hay:
+                    add("family", family_display(fam), r,
+                        0 if fam_hay.startswith(q) else 1)
 
         rank = {"species": 0, "genus": 1, "family": 2}
         hits.sort(key=lambda h: (h["score"], rank[h["kind"]], h["label"]))
@@ -2004,8 +2055,9 @@ class AnnotationTimeline(QWidget):
             self._habitat_colors[h] = _known_hab.get(
                 h, QColor(*FEATURE_COLORS[i % len(FEATURE_COLORS)]))
 
-        # Colors for the 4-point visibility scale (red → green)
+        # Colors for the 5-point visibility scale (red → green)
         self._visibility_colors = {
+            "Very bad": QColor(190, 18, 60),
             "Bad": QColor(239, 68, 68),
             "Fine": QColor(245, 158, 11),
             "Good": QColor(34, 197, 94),
@@ -2321,6 +2373,26 @@ class AnnotationTimeline(QWidget):
 # --------------------------------------------------------------------------
 
 RECENT_JSON = os.path.join(CONFIG_DIR, "recent.json")
+SETTINGS_JSON = os.path.join(CONFIG_DIR, "settings.json")
+
+
+def load_settings():
+    """UI preferences that should survive quitting the app."""
+    try:
+        with open(SETTINGS_JSON) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(d):
+    try:
+        _ensure_config_dir()
+        with open(SETTINGS_JSON, "w") as f:
+            json.dump(d, f, indent=2)
+    except OSError:
+        pass
 
 
 def load_recent():
@@ -2668,7 +2740,7 @@ class TaxonomyPicker(QWidget):
         if self._updating:
             return
         self._updating = True
-        fam = fam.strip()
+        fam = family_from_display(fam)
         genus = self.genus_combo.currentText().strip()
         if genus and TAXONOMY.family_of_genus(genus) != fam:
             genus = ""
@@ -2683,10 +2755,12 @@ class TaxonomyPicker(QWidget):
             return
         self._updating = True
         gen = gen.strip()
-        fam = TAXONOMY.family_of_genus(gen) or self.family_combo.currentText().strip()
-        if fam and fam != self.family_combo.currentText().strip():
+        fam = (TAXONOMY.family_of_genus(gen)
+               or family_from_display(self.family_combo.currentText()))
+        if fam and fam != family_from_display(self.family_combo.currentText()):
             self._fill(self.family_combo,
-                       TAXONOMY.families(self._category or None), fam)
+                       [family_display(f) for f in TAXONOMY.families(self._category or None)],
+                       family_display(fam))
         self._refill_species(fam, gen)
         self._updating = False
         self._sync_level()
@@ -2707,7 +2781,8 @@ class TaxonomyPicker(QWidget):
             fam, gen = row.get("family", ""), row.get("genus", "")
             if fam:
                 self._fill(self.family_combo,
-                           TAXONOMY.families(self._category or None), fam)
+                           [family_display(f) for f in TAXONOMY.families(self._category or None)],
+                           family_display(fam))
             if gen:
                 self._fill(self.genus_combo,
                            TAXONOMY.genera(self._category or None, fam or None), gen)
@@ -2729,8 +2804,9 @@ class TaxonomyPicker(QWidget):
         self._category = category or ""
         cur = self.value()
         self._updating = True
-        self._fill(self.family_combo, TAXONOMY.families(self._category or None),
-                   cur["family"])
+        self._fill(self.family_combo,
+                   [family_display(f) for f in TAXONOMY.families(self._category or None)],
+                   family_display(cur["family"]))
         self._fill(self.genus_combo,
                    TAXONOMY.genera(self._category or None, cur["family"] or None),
                    cur["genus"])
@@ -2744,7 +2820,7 @@ class TaxonomyPicker(QWidget):
         m = _SPECIES_RE.match(sp_disp)
         if m:
             common, species = m.group(1).strip(), f"{m.group(2)} {m.group(3)}"
-        return {"family": self.family_combo.currentText().strip(),
+        return {"family": family_from_display(self.family_combo.currentText()),
                 "genus": self.genus_combo.currentText().strip(),
                 "species": species, "common": common}
 
@@ -2753,7 +2829,9 @@ class TaxonomyPicker(QWidget):
         self._common = common or ""
         if not family and genus:
             family = TAXONOMY.family_of_genus(genus)
-        self._fill(self.family_combo, TAXONOMY.families(self._category or None), family)
+        self._fill(self.family_combo,
+                   [family_display(f) for f in TAXONOMY.families(self._category or None)],
+                   family_display(family))
         self._fill(self.genus_combo,
                    TAXONOMY.genera(self._category or None, family or None), genus)
         rows = TAXONOMY.species_rows(self._category or None,
@@ -2792,7 +2870,7 @@ class TaxonomyPicker(QWidget):
         self.level_lbl.setText(pretty)
 
     def _add_species(self):
-        fam = self.family_combo.currentText().strip()
+        fam = family_from_display(self.family_combo.currentText())
         gen = self.genus_combo.currentText().strip()
         text, ok = QInputDialog.getText(
             self, "Add species",
@@ -3129,12 +3207,13 @@ class MainWindow(QMainWindow):
                                       self.total_frames, self.video_w, self.video_h)
 
         # scene-label selection (persist-until-changed) across all axes
-        self._current_movement = MOVEMENT_OPTIONS[0]
-        self._current_social = SOCIAL_OPTIONS[0]
-        self._current_habitat = HABITAT_OPTIONS[0]
-        # default visibility to the middle of the scale ("Fine"), not "Very bad"
-        self._current_visibility = (VISIBILITY_OPTIONS[len(VISIBILITY_OPTIONS) // 2]
-                                    if VISIBILITY_OPTIONS else "Fine")
+        # Start every axis blank rather than pre-armed with the first option:
+        # scrubbing a video before deliberately choosing a label should record
+        # nothing, not silently paint "Burst swimming" over the whole clip.
+        self._current_movement = None
+        self._current_social = None
+        self._current_habitat = None
+        self._current_visibility = None
         self._type_counters: Dict[str, int] = {}
 
         # selection + editing
@@ -3184,7 +3263,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ UI
     def _make_segment_bar(self, title: str, options: List[str], on_select,
-                          rows: int = 1, on_add=None):
+                          rows: int = 1, on_add=None, allow_none=False):
         """Build a single-row segmented button bar.
 
         Returns (container, btns_dict, append_fn).  append_fn(label) adds a new
@@ -3209,6 +3288,21 @@ class MainWindow(QMainWindow):
         lab.setObjectName("BarTitle")
         lab.setMinimumWidth(66)
         fl.addWidget(lab)
+
+        # "None" clears this axis: selecting it and re-playing/scrubbing over a
+        # stretch erases those labels, which is the fix for having scrubbed
+        # through a video with labeling accidentally left on.
+        if allow_none:
+            nb = QToolButton()
+            nb.setText("None")
+            nb.setCheckable(True)
+            nb.setProperty("segmented", True)
+            nb.setToolTip("Leave this axis unlabeled.\nSelect None, then play or "
+                          "scrub back over a section to erase it.")
+            nb.clicked.connect(lambda checked: on_select(None))
+            group.addButton(nb)
+            btns[None] = nb
+            fl.addWidget(nb)
 
         def _make_btn(opt):
             b = QToolButton()
@@ -3268,17 +3362,20 @@ class MainWindow(QMainWindow):
         self.movement_bar, self._movement_btns, self._movement_append = \
             self._make_segment_bar(
                 "Movement:", MOVEMENT_OPTIONS, self._on_movement_selected,
-                on_add=lambda: self._add_behavior_dialog("movement"))
+                on_add=lambda: self._add_behavior_dialog("movement"),
+                allow_none=True)
         self.social_bar, self._social_btns, self._social_append = \
             self._make_segment_bar(
                 "Social:", SOCIAL_OPTIONS, self._on_social_selected,
-                on_add=lambda: self._add_behavior_dialog("social"))
+                on_add=lambda: self._add_behavior_dialog("social"),
+                allow_none=True)
         self.habitat_bar, self._habitat_btns, self._habitat_append = \
             self._make_segment_bar(
                 "Habitat:", HABITAT_OPTIONS, self._on_habitat_selected,
-                on_add=self._add_habitat_dialog)
+                on_add=self._add_habitat_dialog, allow_none=True)
         self.visibility_bar, self._visibility_btns, _ = self._make_segment_bar(
-            "Visibility:", VISIBILITY_OPTIONS, self._on_visibility_selected
+            "Visibility:", VISIBILITY_OPTIONS, self._on_visibility_selected,
+            allow_none=True
         )
         # Conspecific shark logger lives ON the social bar (sharks are a social
         # observation, not a fish-ID annotation)
@@ -3527,7 +3624,7 @@ class MainWindow(QMainWindow):
         card_v = QVBoxLayout()
         card_v.setContentsMargins(12, 12, 12, 12)
         card_v.setSpacing(8)
-        title = QLabel("Controls")
+        title = QLabel("Fish labeler")
         title.setObjectName("Title")
         subtitle = QLabel("Label movement, social, habitat & visibility. "
                           "Draw bboxes to annotate animals; add notes at any frame.")
@@ -3547,6 +3644,7 @@ class MainWindow(QMainWindow):
         rw.setHorizontalScrollBarPolicy(hbar_off)
         rw.setMaximumWidth(400)
         rw.setMinimumWidth(290)
+        self._right_panel = rw
 
         # ---- playback controls ----
         self.play_btn = QPushButton("Play")
@@ -3610,6 +3708,12 @@ class MainWindow(QMainWindow):
         self.zoom_lbl = QLabel("1.0×")
         self.zoom_lbl.setObjectName("Subtle")
 
+        self.focus_btn = QPushButton("Focus")
+        self.focus_btn.setCheckable(True)
+        self.focus_btn.setObjectName("Secondary")
+        self.focus_btn.setToolTip("Hide the panels and just watch the video (F)")
+        self.focus_btn.clicked.connect(lambda: self._toggle_focus_mode())
+
         # Playlist switcher (multiple videos / folder loading)
         self.video_combo = QComboBox()
         self.video_combo.setMinimumWidth(110)
@@ -3630,7 +3734,8 @@ class MainWindow(QMainWindow):
         ctrls = FlowLayout(margin=0, spacing=7)
         for w in (self.back_btn, self.play_btn, self.fwd_btn, self.frame_lbl,
                   self.video_combo, zoom_out_btn, self.zoom_lbl, zoom_in_btn,
-                  zoom_reset_btn, self.label_mode_btn, axis_host, speed_host):
+                  zoom_reset_btn, self.focus_btn, self.label_mode_btn,
+                  axis_host, speed_host):
             ctrls.addWidget(w)
 
         # ---- bottom timeline scrubber ----
@@ -3677,6 +3782,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.timeline)
         lay.addLayout(ctrls)
         central.setLayout(lay)
+
+        # Focus mode + remembered preferences
+        self._focus_mode = False
+        self._focus_hidden = []
+        self._apply_saved_settings()
 
         # Qt derives a minimum from the worst-case wrapping of the label bars
         # (very narrow window -> many rows) and would otherwise refuse to shrink
@@ -3787,9 +3897,14 @@ class MainWindow(QMainWindow):
         self._display_frame(fidx)
         if hasattr(self, "timeline"):
             self.timeline.update()
-        if species:
+        # Report the ID at whatever rank was actually recorded (species,
+        # genus or family). NOTE: read this off the feature, not a local —
+        # a stale local here previously raised NameError inside the Qt slot
+        # and took the whole app down mid-annotation.
+        id_txt = feat.id_label()
+        if id_txt and id_txt != species_category:
             self.statusBar().showMessage(
-                f"Added {species_category} ({species}) ×{count} '{name}' on frame {fidx}."
+                f"Added {species_category} ({id_txt}) ×{count} '{name}' on frame {fidx}."
             )
         else:
             self.statusBar().showMessage(
@@ -3824,38 +3939,46 @@ class MainWindow(QMainWindow):
         ly = oy + (vy - rvy) * ph / max(1e-6, rvh)
         return (lx, ly)
 
-    def _on_movement_selected(self, label: str):
+    def _on_movement_selected(self, label):
+        """label=None means 'unlabeled' — selecting None and scrubbing back
+        over a section erases it."""
         self._push_undo()
         self._current_movement = label
         self.store.set_movement(self.current_frame_idx, label)
         if hasattr(self, "timeline"):
             self.timeline.update()
-        self.statusBar().showMessage(f"Movement: {label}")
+        self.statusBar().showMessage(f"Movement: {label or '— none (erasing) —'}")
 
-    def _on_social_selected(self, label: str):
+    def _on_social_selected(self, label):
+        """label=None means 'unlabeled' — selecting None and scrubbing back
+        over a section erases it."""
         self._push_undo()
         self._current_social = label
         self.store.set_social(self.current_frame_idx, label)
         if hasattr(self, "timeline"):
             self.timeline.update()
         self._refresh_shark_log()   # spans derive from social segments
-        self.statusBar().showMessage(f"Social: {label}")
+        self.statusBar().showMessage(f"Social: {label or '— none (erasing) —'}")
 
-    def _on_habitat_selected(self, label: str):
+    def _on_habitat_selected(self, label):
+        """label=None means 'unlabeled' — selecting None and scrubbing back
+        over a section erases it."""
         self._push_undo()
         self._current_habitat = label
         self.store.set_habitat(self.current_frame_idx, label)
         if hasattr(self, "timeline"):
             self.timeline.update()
-        self.statusBar().showMessage(f"Habitat: {label}")
+        self.statusBar().showMessage(f"Habitat: {label or '— none (erasing) —'}")
 
-    def _on_visibility_selected(self, label: str):
+    def _on_visibility_selected(self, label):
+        """label=None means 'unlabeled' — selecting None and scrubbing back
+        over a section erases it."""
         self._push_undo()
         self._current_visibility = label
         self.store.set_visibility(self.current_frame_idx, label)
         if hasattr(self, "timeline"):
             self.timeline.update()
-        self.statusBar().showMessage(f"Visibility: {label}")
+        self.statusBar().showMessage(f"Visibility: {label or '— none (erasing) —'}")
 
     def _add_behavior_dialog(self, axis: str):
         """Prompt for a new movement/social behavior, persist to CSV, add live."""
@@ -3933,28 +4056,32 @@ class MainWindow(QMainWindow):
         self.movement_bar, self._movement_btns, self._movement_append = \
             self._make_segment_bar("Movement:", MOVEMENT_OPTIONS,
                                    self._on_movement_selected,
-                                   on_add=lambda: self._add_behavior_dialog("movement"))
+                                   on_add=lambda: self._add_behavior_dialog("movement"),
+                                   allow_none=True)
         self.social_bar, self._social_btns, self._social_append = \
             self._make_segment_bar("Social:", SOCIAL_OPTIONS,
                                    self._on_social_selected,
-                                   on_add=lambda: self._add_behavior_dialog("social"))
+                                   on_add=lambda: self._add_behavior_dialog("social"),
+                                   allow_none=True)
         self.habitat_bar, self._habitat_btns, self._habitat_append = \
             self._make_segment_bar("Habitat:", HABITAT_OPTIONS,
                                    self._on_habitat_selected,
-                                   on_add=self._add_habitat_dialog)
+                                   on_add=self._add_habitat_dialog,
+                                   allow_none=True)
         self.social_bar.layout().addWidget(self._shark_logger)  # re-attach
         self._bars_col.insertWidget(0, self.movement_bar)
         self._bars_col.insertWidget(1, self.social_bar)
         self._bars_col.insertWidget(2, self.habitat_bar)
         # keep valid current selections, else fall back to first option
-        self._current_movement = cur[0] if cur[0] in MOVEMENT_OPTIONS else MOVEMENT_OPTIONS[0]
-        self._current_social = cur[1] if cur[1] in SOCIAL_OPTIONS else SOCIAL_OPTIONS[0]
-        self._current_habitat = cur[2] if cur[2] in HABITAT_OPTIONS else HABITAT_OPTIONS[0]
+        self._current_movement = cur[0] if (cur[0] is None or cur[0] in MOVEMENT_OPTIONS) else MOVEMENT_OPTIONS[0]
+        self._current_social = cur[1] if (cur[1] is None or cur[1] in SOCIAL_OPTIONS) else SOCIAL_OPTIONS[0]
+        self._current_habitat = cur[2] if (cur[2] is None or cur[2] in HABITAT_OPTIONS) else HABITAT_OPTIONS[0]
         for d, k in ((self._movement_btns, self._current_movement),
                      (self._social_btns, self._current_social),
                      (self._habitat_btns, self._current_habitat)):
-            if k in d:
-                d[k].setChecked(True)
+            b = d.get(k)
+            if b is not None:
+                b.setChecked(True)
         # rebuild timeline colors + category/species combos
         self._rebuild_timeline_colors()
         self._rebuild_category_combo()
@@ -4174,8 +4301,10 @@ class MainWindow(QMainWindow):
         stored_vis = self.store.visibility_per_frame[idx]
 
         if not self.playing:
-            # Seek/drag: update _current_* from stored values so the UI shows
-            # what was annotated here, and future playback continues from it.
+            # The bars are the *pen*, not a readout of the frame. Adopt a stored
+            # label when the frame has one (so you can see and continue it), but
+            # keep the current pen over unlabeled stretches so you can keep
+            # labeling forward. Selecting "None" sets the pen to erase.
             if stored_mov is not None:
                 self._current_movement = stored_mov
             if stored_soc is not None:
@@ -4186,14 +4315,13 @@ class MainWindow(QMainWindow):
                 self._current_visibility = stored_vis
         # During playback: _current_* stays fixed; _tick writes it to each frame.
 
-        if self._current_movement in self._movement_btns:
-            self._movement_btns[self._current_movement].setChecked(True)
-        if self._current_social in self._social_btns:
-            self._social_btns[self._current_social].setChecked(True)
-        if self._current_habitat in self._habitat_btns:
-            self._habitat_btns[self._current_habitat].setChecked(True)
-        if self._current_visibility in self._visibility_btns:
-            self._visibility_btns[self._current_visibility].setChecked(True)
+        for cur, btns in ((self._current_movement, self._movement_btns),
+                          (self._current_social, self._social_btns),
+                          (self._current_habitat, self._habitat_btns),
+                          (self._current_visibility, self._visibility_btns)):
+            b = btns.get(cur)      # cur may be None -> the "None" button
+            if b is not None:
+                b.setChecked(True)
 
     # ------------------------------------------------------- feature list
     def _refresh_features(self):
@@ -4375,9 +4503,10 @@ class MainWindow(QMainWindow):
 
         # Keep this compact — it sits in the bottom control strip, and a long
         # string here used to force the whole window wider than small screens.
-        full = (f"Frame {idx}/{self.total_frames - 1} • {self._current_movement}"
-                f" + {self._current_social} • {self._current_habitat}"
-                f" • vis: {self._current_visibility}")
+        _n = lambda v: v if v else "—"
+        full = (f"Frame {idx}/{self.total_frames - 1} • {_n(self._current_movement)}"
+                f" + {_n(self._current_social)} • {_n(self._current_habitat)}"
+                f" • vis: {_n(self._current_visibility)}")
         self.frame_lbl.setText(f"Frame {idx}/{self.total_frames - 1}")
         self.frame_lbl.setToolTip(full)
 
@@ -4467,8 +4596,8 @@ class MainWindow(QMainWindow):
         soc = self.store.social_per_frame[idx] or self._current_social
         hab = self.store.habitat_per_frame[idx] or self._current_habitat
         vis = self.store.visibility_per_frame[idx] or self._current_visibility
-        line1 = f"{mov}  |  {soc}"
-        line2 = f"{hab}  |  vis: {vis}"
+        line1 = f"{mov or '—'}  |  {soc or '—'}"
+        line2 = f"{hab or '—'}  |  vis: {vis or '—'}"
         for i, text in enumerate((line1, line2)):
             y = 30 + i * 28
             cv2.putText(img, text, (14, y),
@@ -4597,6 +4726,8 @@ class MainWindow(QMainWindow):
                 self._toggle_draw_shortcut(); ev.accept(); return
             elif key == K.Key_C:
                 self._focus_comment(); ev.accept(); return
+            elif key == K.Key_F:
+                self._toggle_focus_mode(); ev.accept(); return
             elif key == K.Key_I:
                 self._mark_in(); ev.accept(); return
             elif key == K.Key_O:
@@ -5200,6 +5331,7 @@ class MainWindow(QMainWindow):
             "Mud":          "#78644A",
         }
         VIS_COLORS = {
+            "Very bad":  "#BE123C",
             "Bad":       "#EF4444",
             "Fine":      "#F59E0B",
             "Good":      "#22C55E",
@@ -6128,12 +6260,74 @@ class MainWindow(QMainWindow):
     def _open_config_folder(self):
         self._reveal_folder(CONFIG_DIR)
 
+    # ------------------------------------------------------- focus mode
+    def _toggle_focus_mode(self, on=None):
+        """Hide everything except the video so it can be watched large."""
+        self._focus_mode = (not self._focus_mode) if on is None else bool(on)
+        panels = [w for w in (getattr(self, "_right_panel", None),
+                              getattr(self, "_bars_host", None),
+                              getattr(self, "timeline", None)) if w is not None]
+        for w in panels:
+            w.setVisible(not self._focus_mode)
+        if hasattr(self, "focus_btn"):
+            self.focus_btn.setChecked(self._focus_mode)
+            self.focus_btn.setText("Exit focus" if self._focus_mode else "Focus")
+        self.statusBar().showMessage(
+            "Focus mode — press F or the button to bring the panels back."
+            if self._focus_mode else "")
+        # Redraw only after the layout has actually resized the video pane,
+        # otherwise the frame is rescaled to the pre-toggle size and the video
+        # doesn't grow into the space the hidden panels just freed up.
+        QTimer.singleShot(0, lambda: self._display_frame(self.current_frame_idx))
+
+    # ---------------------------------------------------- saved settings
+    def _collect_settings(self):
+        return {
+            "geometry": [self.width(), self.height()],
+            "focus_mode": self._focus_mode,
+            "labeling": bool(self._labeling),
+            "label_axes": dict(self._label_axes),
+            "speed": self.speed_combo.currentText() if hasattr(self, "speed_combo") else "1x",
+            "category": self.category_combo.currentText() if hasattr(self, "category_combo") else "",
+        }
+
+    def _apply_saved_settings(self):
+        st = load_settings()
+        if not st:
+            return
+        axes = st.get("label_axes")
+        if isinstance(axes, dict):
+            for k, v in axes.items():
+                if k in self._label_axes:
+                    self._label_axes[k] = bool(v)
+                    cb = self._axis_checkboxes.get(k)
+                    if cb is not None:
+                        cb.blockSignals(True); cb.setChecked(bool(v)); cb.blockSignals(False)
+        if "labeling" in st and hasattr(self, "label_mode_btn"):
+            on = bool(st["labeling"])
+            self._labeling = on
+            self.label_mode_btn.setChecked(on)
+            self.label_mode_btn.setText("Labeling: ON" if on else "Labeling: OFF")
+        spd = st.get("speed")
+        if spd and hasattr(self, "speed_combo"):
+            i = self.speed_combo.findText(spd)
+            if i >= 0:
+                self.speed_combo.setCurrentIndex(i)
+        cat = st.get("category")
+        if cat and hasattr(self, "category_combo"):
+            i = self.category_combo.findText(cat)
+            if i >= 0:
+                self.category_combo.setCurrentIndex(i)
+        if st.get("focus_mode"):
+            QTimer.singleShot(0, lambda: self._toggle_focus_mode(True))
+
     def _show_help(self):
         QMessageBox.information(
             self, "CTAG Annotator — Shortcuts & help",
             "KEYBOARD SHORTCUTS\n"
             "  ←/→  step 1 frame      Ctrl+←/→  jump 10 frames\n"
             "  Space  play/pause      B  arm Draw Bbox     C  focus Comment box\n"
+            "  F  focus mode (video only)\n"
             "  I / O  mark clip In/Out    Delete  remove selected animal\n"
             "  ⌘Z / Ctrl+Z  undo      Ctrl +/-  zoom in/out\n"
             "  Ctrl+S  save JSON      Ctrl+E  export clip     F1  this help\n"
@@ -6177,6 +6371,10 @@ class MainWindow(QMainWindow):
         # persist work before closing
         try:
             self._autosave()
+        except Exception:
+            pass
+        try:
+            save_settings(self._collect_settings())
         except Exception:
             pass
         if hasattr(self, "autosave_timer"):
@@ -6299,6 +6497,54 @@ def prepare_source(path: str, is_frame_dir: bool, silent: bool = False) -> dict:
     }
 
 
+def _install_crash_guard():
+    """Keep a Python error in a Qt slot from killing the whole app.
+
+    PyQt aborts the process when an exception escapes a slot, so a single
+    coding mistake in a handler took the app down mid-annotation and threw
+    away everything since the last autosave (exactly how the "crash when you
+    place a box" bug behaved). Route those through a hook that flushes work
+    to disk first, then tells the user what happened and carries on.
+    """
+    import traceback
+    state = {"showing": False}
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        sys.stderr.write(text)
+        sys.stderr.flush()
+        saved_to = None
+        try:  # emergency save before anything else can go wrong
+            for w in QApplication.topLevelWidgets():
+                if isinstance(w, MainWindow) and w._has_annotations():
+                    ok, _err = w._safe_save(w._autosave_path())
+                    if ok:
+                        saved_to = w._autosave_path()
+        except Exception:
+            pass
+        if state["showing"]:      # never stack dialogs on repeated errors
+            return
+        try:
+            state["showing"] = True
+            note = (f"\n\nYour work was saved to:\n{saved_to}"
+                    if saved_to else
+                    "\n\nNo unsaved annotations were pending.")
+            QMessageBox.critical(
+                None, "Something went wrong",
+                "The annotator hit an internal error, but it has NOT closed "
+                "and your annotations are intact." + note +
+                "\n\nPlease send this to Mark:\n\n" + text[-1200:])
+        except Exception:
+            pass
+        finally:
+            state["showing"] = False
+
+    sys.excepthook = hook
+
+
 def _enable_hidpi():
     """Best-effort crispness across Qt5/Qt6."""
     try:
@@ -6329,6 +6575,7 @@ def main():
 
     _enable_hidpi()
     app = QApplication(sys.argv)
+    _install_crash_guard()
 
     try:
         app.setStyle("Fusion")
