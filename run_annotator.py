@@ -450,6 +450,10 @@ ALL_SPECIES = [s for species in SPECIES_CATEGORIES.values() for s in species]
 # "＋ Add" buttons which append to them live.
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), "CTAG_Annotator")
+# Shown in Help and written into every error log line, so a bug report says
+# which build the annotator was running (students keep old zips around).
+APP_VERSION = "2026.09.18"
+LOG_DIR = os.path.join(CONFIG_DIR, "logs")
 SPECIES_CSV = os.path.join(CONFIG_DIR, "species.csv")
 TAXONOMY_CSV = os.path.join(CONFIG_DIR, "taxonomy.csv")
 BEHAVIORS_CSV = os.path.join(CONFIG_DIR, "behaviors.csv")
@@ -3442,11 +3446,18 @@ class MainWindow(QMainWindow):
         del_btn = QPushButton("Delete")
         del_btn.setObjectName("Secondary")
         del_btn.clicked.connect(self._delete_feature)
-        ren_btn = QPushButton("Update")
-        ren_btn.setObjectName("Secondary")
-        ren_btn.clicked.connect(self._update_feature)
+        # Edits to a selected box apply instantly (see _live_edit), so there is
+        # no "Update" step to forget — just a way to leave edit mode.
+        self.done_edit_btn = QPushButton("Done editing")
+        self.done_edit_btn.setObjectName("Secondary")
+        self.done_edit_btn.clicked.connect(self._end_edit)
         fa.addWidget(del_btn)
-        fa.addWidget(ren_btn)
+        fa.addWidget(self.done_edit_btn)
+
+        # Says which mode the fields below are in: settings for the NEXT box,
+        # or live edits to an existing one.
+        self.edit_banner = QLabel()
+        self.edit_banner.setWordWrap(True)
 
         self.name_edit = QLineEdit("feature")
 
@@ -3524,6 +3535,16 @@ class MainWindow(QMainWindow):
         self.video_label.bboxEdited.connect(self._on_bbox_edited)
         self.video_label.zoomRequested.connect(self._on_wheel_zoom)
         self.video_label.pointClicked.connect(self._on_video_click)
+        # Live editing of the selected box
+        self._loading_edit = False     # True while WE fill the fields
+        self._edit_undo_for = None     # feature idx whose edit burst has an undo point
+        self._new_box_fields = None    # next-box settings stashed during an edit
+        self.name_edit.textEdited.connect(lambda _t: self._live_edit())
+        self.category_combo.currentTextChanged.connect(lambda _t: self._live_edit())
+        self.taxon.changed.connect(self._live_edit)
+        self.count_spin.valueChanged.connect(lambda _v: self._live_edit())
+        self.confidence_combo.currentTextChanged.connect(lambda _t: self._live_edit())
+        self._update_edit_banner()
         self.video_label.firstCornerPlaced.connect(
             lambda: self.statusBar().showMessage(
                 "Now click the opposite corner (right-click to cancel)."))
@@ -3590,12 +3611,13 @@ class MainWindow(QMainWindow):
 
         # Pack into a "card"
         card_layout = QVBoxLayout()
+        card_layout.addWidget(self.edit_banner)
         card_layout.addLayout(category_row)
         card_layout.addWidget(self.taxon)
         card_layout.addLayout(count_row)
         card_layout.addLayout(name_row)
         card_layout.addWidget(self.bbox_btn)
-        card_layout.addWidget(QLabel("Annotated Features:"))
+        card_layout.addWidget(QLabel("Boxes (click one to jump to it and edit):"))
         card_layout.addWidget(self.feat_list, stretch=1)
         card_layout.addLayout(fa)
         card_layout.addWidget(QLabel("Shark log (from Social bar, double-click to jump):"))
@@ -3841,6 +3863,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ env/sub
     def _bbox_mode_toggled(self, on: bool):
+        if on and self._selected_feature_idx is not None:
+            self._end_edit()           # fields go back to next-box settings
         self.video_label.set_bbox_mode(on)
         self._update_edit_rect(self.current_frame_idx)
         if on:
@@ -3892,7 +3916,6 @@ class MainWindow(QMainWindow):
             confidence=confidence,
         )
         self.store.add_feature(feat, {}, {fidx: (x1, y1, x2, y2)})
-        self._selected_feature_idx = len(self.store.features) - 1
         self._refresh_features()
         self._display_frame(fidx)
         if hasattr(self, "timeline"):
@@ -4113,6 +4136,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "category_combo"):
             return
         cur = self.category_combo.currentText()
+        self._loading_edit = True
         self.category_combo.blockSignals(True)
         self.category_combo.clear()
         self.category_combo.addItems(SPECIES_CATEGORY_ORDER)
@@ -4120,6 +4144,7 @@ class MainWindow(QMainWindow):
         self.category_combo.setCurrentIndex(i if i >= 0 else 0)
         self.category_combo.blockSignals(False)
         self._on_category_changed(self.category_combo.currentText())
+        self._loading_edit = False
 
     # ------------------------------------------------- conspecific sharks
     def _make_shark_logger(self):
@@ -4324,29 +4349,56 @@ class MainWindow(QMainWindow):
                 b.setChecked(True)
 
     # ------------------------------------------------------- feature list
+    @staticmethod
+    def _feature_row_text(feat) -> str:
+        label = feat.species_category
+        _idl = feat.id_label()
+        if _idl and _idl != feat.species_category:
+            label = f"{feat.species_category}: {_idl}"
+        extra = ""
+        summary = feat.sex_summary()
+        if summary:
+            extra += f"  [{summary}]"
+        elif feat.sex:
+            extra += {"Male": " ♂", "Female": " ♀", "Unknown": " ?"}.get(feat.sex, "")
+        if feat.confidence:
+            extra += f"  conf:{feat.confidence}"
+        return f"{label}{extra}  ×{feat.count}  [f{feat.init_frame}]  {feat.name}"
+
     def _refresh_features(self):
-        self.feat_list.clear()
-        for i, feat in enumerate(self.store.features):
-            c = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)]
-            label = feat.species_category
-            _idl = feat.id_label()
-            if _idl and _idl != feat.species_category:
-                label = f"{feat.species_category}: {_idl}"
-            extra = ""
-            summary = feat.sex_summary()
-            if summary:
-                extra += f"  [{summary}]"
-            elif feat.sex:
-                extra += {"Male": " ♂", "Female": " ♀", "Unknown": " ?"}.get(feat.sex, "")
-            if feat.confidence:
-                extra += f"  conf:{feat.confidence}"
-            display = f"{label}{extra}  ×{feat.count}  [f{feat.init_frame}]  {feat.name}"
-            it = QListWidgetItem(display)
-            it.setToolTip(display)   # full text on hover (rows elide when narrow)
-            user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
-            it.setData(user_role, i)
-            it.setForeground(QColor(*c))
-            self.feat_list.addItem(it)
+        """Rebuild the box list, KEEPING the current selection.
+
+        Signals are blocked so rebuilding never looks like the user picking
+        (or un-picking) a box; selection is owned by _selected_feature_idx.
+        """
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        self.feat_list.blockSignals(True)
+        try:
+            self.feat_list.clear()
+            for i, feat in enumerate(self.store.features):
+                c = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)]
+                display = self._feature_row_text(feat)
+                it = QListWidgetItem(display)
+                it.setToolTip(display)   # full text on hover (rows elide when narrow)
+                it.setData(user_role, i)
+                it.setForeground(QColor(*c))
+                self.feat_list.addItem(it)
+            sel = self._selected_feature_idx
+            if sel is not None and 0 <= sel < len(self.store.features):
+                self.feat_list.setCurrentRow(sel)
+                if getattr(self, "_new_box_fields", None) is None:
+                    self._new_box_fields = self._fields_snapshot()
+                self._populate_fields(self.store.features[sel])
+            else:
+                self.feat_list.setCurrentRow(-1)
+        finally:
+            self.feat_list.blockSignals(False)
+        sel = self._selected_feature_idx
+        if sel is not None and not (0 <= sel < len(self.store.features)):
+            self._end_edit()
+        elif sel is None and getattr(self, "_new_box_fields", None) is not None:
+            self._end_edit()
+        self._update_edit_banner()
 
     def _delete_feature(self):
         it = self.feat_list.currentItem()
@@ -4357,53 +4409,120 @@ class MainWindow(QMainWindow):
         if idx is None:
             idx = self._selected_feature_idx  # Delete key with no list focus
         if idx is None or not (0 <= int(idx) < len(self.store.features)):
+            self.statusBar().showMessage(
+                "Select a box first (click it on the video or in the list).")
             return
         self._push_undo()
+        name = self.store.features[int(idx)].name
         self.store.remove_feature(int(idx))
         self._selected_feature_idx = None
-        self.video_label.set_edit_rect(None)
+        self._end_edit()
         self._refresh_features()
         self._display_frame(self.current_frame_idx)
         if hasattr(self, "timeline"):
             self.timeline.update()
-        self.statusBar().showMessage("Deleted feature.")
+        self.statusBar().showMessage(f"Deleted '{name}'.  Press ⌘Z / Ctrl+Z to undo.")
 
-    def _on_feature_selected(self, current, previous):
-        """Populate edit fields when a feature is selected in the list."""
-        if current is None:
-            self._selected_feature_idx = None
-            self.video_label.set_edit_rect(None)
-            return
-        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
-        idx = current.data(user_role)
-        if idx is None or not (0 <= idx < len(self.store.features)):
-            return
-        self._selected_feature_idx = int(idx)
-        self._update_edit_rect(self.current_frame_idx)
-        feat = self.store.features[idx]
-        self.name_edit.setText(feat.name)
-        self.count_spin.setValue(max(1, feat.count))
-        # Set confidence combo
-        ci = self.confidence_combo.findText(feat.confidence)
-        self.confidence_combo.setCurrentIndex(ci if ci >= 0 else 0)
-        # Set category combo
-        cat_idx = self.category_combo.findText(feat.species_category)
-        if cat_idx >= 0:
-            self.category_combo.setCurrentIndex(cat_idx)
-        # Set species combo (after category filter is applied)
-        self.taxon.set_value(feat.family, feat.genus, feat.species, feat.common)
+    # -- selecting & editing a placed box ---------------------------------
+    def _fields_snapshot(self) -> dict:
+        return {"name": self.name_edit.text(),
+                "category": self.category_combo.currentText(),
+                "tax": self.taxon.value(),
+                "count": self.count_spin.value(),
+                "conf": self.confidence_combo.currentText()}
 
-    def _update_feature(self):
-        """Save name/species/count changes back to the selected feature."""
-        it = self.feat_list.currentItem()
-        if it is None:
+    def _set_fields(self, name, category, tax, count, conf):
+        self._loading_edit = True
+        try:
+            self.name_edit.setText(name)
+            ci = self.category_combo.findText(category)
+            if ci >= 0:
+                self.category_combo.setCurrentIndex(ci)
+            self.taxon.set_value(tax.get("family", ""), tax.get("genus", ""),
+                                 tax.get("species", ""), tax.get("common", ""))
+            self.count_spin.setValue(max(1, int(count or 1)))
+            ci = self.confidence_combo.findText(conf or "")
+            self.confidence_combo.setCurrentIndex(ci if ci >= 0 else 0)
+        finally:
+            self._loading_edit = False
+
+    def _populate_fields(self, feat):
+        self._set_fields(feat.name, feat.species_category,
+                         {"family": feat.family, "genus": feat.genus,
+                          "species": feat.species, "common": feat.common},
+                         feat.count, feat.confidence)
+
+    def _select_feature(self, idx: int):
+        """Enter edit mode on box `idx`: jump to a frame where it is drawn,
+        show its corner handles, and load its details into the fields."""
+        if not (0 <= idx < len(self.store.features)):
             return
-        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
-        idx = it.data(user_role)
-        if idx is None or not (0 <= int(idx) < len(self.store.features)):
+        if self.bbox_btn.isChecked():
+            self.bbox_btn.setChecked(False)
+        if self._selected_feature_idx is None and self._new_box_fields is None:
+            self._new_box_fields = self._fields_snapshot()
+        self._selected_feature_idx = idx
+        self._edit_undo_for = None
+        frames = self.store.feature_bboxes[idx]
+        if frames and self.current_frame_idx not in frames:
+            # Boxes live on the single frame they were drawn on; bring that
+            # frame up so the box is actually visible and editable.
+            if self.playing:
+                self.toggle_play()
+            self.seek_to(min(frames, key=lambda f: abs(f - self.current_frame_idx)))
+        self.feat_list.blockSignals(True)
+        self.feat_list.setCurrentRow(idx)
+        self.feat_list.blockSignals(False)
+        self._populate_fields(self.store.features[idx])
+        self._display_frame(self.current_frame_idx)
+        self._update_edit_banner()
+        self.statusBar().showMessage(
+            f"Editing '{self.store.features[idx].name}' — changes apply "
+            "immediately; drag a corner to resize; Esc when done.")
+
+    def _end_edit(self):
+        """Leave edit mode; the fields return to the next-box settings."""
+        had = self._selected_feature_idx is not None
+        self._selected_feature_idx = None
+        self._edit_undo_for = None
+        self.video_label.set_edit_rect(None)
+        self.feat_list.blockSignals(True)
+        self.feat_list.setCurrentRow(-1)
+        self.feat_list.clearSelection()
+        self.feat_list.blockSignals(False)
+        stash = getattr(self, "_new_box_fields", None)
+        self._new_box_fields = None
+        if stash is not None:
+            self._set_fields(stash["name"], stash["category"], stash["tax"],
+                             stash["count"], stash["conf"])
+        self._update_edit_banner()
+        if had:
+            self._display_frame(self.current_frame_idx)
+
+    def _update_edit_banner(self):
+        if not hasattr(self, "edit_banner"):
             return
-        self._push_undo()
-        feat = self.store.features[int(idx)]
+        fi = self._selected_feature_idx
+        if fi is not None and 0 <= fi < len(self.store.features):
+            feat = self.store.features[fi]
+            self.edit_banner.setText(
+                f"<b>Editing box “{feat.name}”</b> (frame {feat.init_frame}). "
+                "Changes below save instantly. Press <b>Esc</b> or "
+                "<b>Done editing</b> when finished.")
+            self.edit_banner.setStyleSheet(
+                "QLabel { background:#FEF3C7; color:#78350F; border:1px solid #F59E0B;"
+                " border-radius:6px; padding:5px; }")
+            self.done_edit_btn.setEnabled(True)
+        else:
+            self.edit_banner.setText(
+                "<b>Next box:</b> set the ID below, press <b>Draw Bbox</b> (B), "
+                "then click two corners. Click any existing box to edit it.")
+            self.edit_banner.setStyleSheet(
+                "QLabel { background:#EEF2FF; color:#3730A3; border-radius:6px;"
+                " padding:5px; }")
+            self.done_edit_btn.setEnabled(False)
+
+    def _apply_fields_to(self, feat):
         name = (self.name_edit.text() or "").strip()
         if name:
             feat.name = name
@@ -4415,6 +4534,50 @@ class MainWindow(QMainWindow):
         feat.common = _tax["common"]
         feat.confidence = self.confidence_combo.currentText().strip()
         feat.count = self.count_spin.value()
+
+    def _live_edit(self):
+        """A field changed while a box is selected → write it to that box."""
+        if getattr(self, "_loading_edit", True):
+            return
+        fi = self._selected_feature_idx
+        if fi is None or not (0 <= fi < len(self.store.features)):
+            return
+        if self._edit_undo_for != fi:
+            self._push_undo()          # one undo step per editing session
+            self._edit_undo_for = fi
+        else:
+            self._mark_dirty()
+        feat = self.store.features[fi]
+        self._apply_fields_to(feat)
+        it = self.feat_list.item(fi)
+        if it is not None:
+            txt = self._feature_row_text(feat)
+            it.setText(txt)
+            it.setToolTip(txt)
+        self._display_frame(self.current_frame_idx)
+        if hasattr(self, "timeline"):
+            self.timeline.update()
+        self._update_edit_banner()
+
+    def _on_feature_selected(self, current, previous):
+        """User picked a row in the box list."""
+        if current is None:
+            return
+        user_role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
+        idx = current.data(user_role)
+        if idx is None or not (0 <= int(idx) < len(self.store.features)):
+            return
+        self._select_feature(int(idx))
+
+    def _update_feature(self):
+        """Explicitly write the fields to the selected box (kept for scripts;
+        the UI now applies edits live)."""
+        fi = self._selected_feature_idx
+        if fi is None or not (0 <= fi < len(self.store.features)):
+            return
+        self._push_undo()
+        feat = self.store.features[fi]
+        self._apply_fields_to(feat)
         self._refresh_features()
         self._display_frame(self.current_frame_idx)
         if hasattr(self, "timeline"):
@@ -4543,6 +4706,20 @@ class MainWindow(QMainWindow):
         for _, feat, mask, bbox in self.store.features_at(idx):
             bgr = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)][::-1]
             self._draw_mask(preview, mask, bgr, self._feature_label(feat), bbox)
+
+        # boxes drawn on nearby frames: dashed, with how far away they are
+        fps = max(1e-6, self.fps)
+        for i, f, bbox in self._nearby_boxes(idx):
+            feat = self.store.features[i]
+            bgr = FEATURE_COLORS[feat.color_idx % len(FEATURE_COLORS)][::-1]
+            self._draw_dashed_rect(preview, bbox, bgr)
+            dt = (f - idx) / fps
+            tag = f"{feat.name} at {'+' if dt > 0 else ''}{dt:.1f}s"
+            x1, y1 = int(bbox[0]), int(bbox[1])
+            cv2.putText(preview, tag, (x1, max(14, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(preview, tag, (x1, max(14, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
 
         # scene text (anti-aliased)
         self._draw_scene_overlay(preview, idx)
@@ -4677,28 +4854,58 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Resized box for '{feat.name}'.")
 
     def _on_video_click(self, pos):
-        """Click on the video (not drawing/editing) → select the feature whose
-        box is under the cursor, so it can be edited or deleted."""
+        """Click on the video (not drawing/editing): select the box under the
+        cursor; a dashed box from a nearby frame jumps there; empty space
+        leaves edit mode."""
         m = self._map(pos.x(), pos.y())
         if m is None:
             return
         px, py = m
+        def inside(b):
+            x1, y1, x2, y2 = b
+            return min(x1, x2) <= px <= max(x1, x2) and min(y1, y2) <= py <= max(y1, y2)
         hit = None
         for i, feat, mask, bbox in self.store.features_at(self.current_frame_idx):
-            if bbox is None:
-                continue
-            x1, y1, x2, y2 = bbox
-            if min(x1, x2) <= px <= max(x1, x2) and min(y1, y2) <= py <= max(y1, y2):
+            if bbox is not None and inside(bbox):
                 hit = i  # last (topmost) match wins
         if hit is None:
-            return
-        # select it in the list (drives _selected_feature_idx + edit handles)
-        for row in range(self.feat_list.count()):
-            it = self.feat_list.item(row)
-            role = Qt.ItemDataRole.UserRole if _QT6 else Qt.UserRole
-            if it.data(role) == hit:
-                self.feat_list.setCurrentRow(row)
-                break
+            for i, f, bbox in self._nearby_boxes(self.current_frame_idx):
+                if inside(bbox):
+                    hit = i
+                    break
+        if hit is not None:
+            self._select_feature(hit)
+        elif self._selected_feature_idx is not None:
+            self._end_edit()
+
+    def _nearby_boxes(self, idx, radius=None):
+        """(feat_idx, frame, bbox) for boxes drawn within `radius` frames of
+        idx but not on idx itself — shown dashed so a box never seems to have
+        vanished just because you came back one frame off."""
+        if radius is None:
+            radius = max(1, int(round(self.fps)))      # ±1 second
+        out = []
+        for i, frames in enumerate(self.store.feature_bboxes):
+            if not frames or idx in frames:
+                continue
+            f = min(frames, key=lambda k: abs(k - idx))
+            if abs(f - idx) <= radius:
+                out.append((i, f, frames[f]))
+        return out
+
+    @staticmethod
+    def _draw_dashed_rect(img, bbox, bgr, dash=10, thick=1):
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        def seg(ax, ay, bx, by):
+            length = max(abs(bx - ax), abs(by - ay))
+            for s0 in range(0, length, dash * 2):
+                s1 = min(length, s0 + dash)
+                t0, t1 = s0 / max(1, length), s1 / max(1, length)
+                cv2.line(img, (int(ax + (bx - ax) * t0), int(ay + (by - ay) * t0)),
+                         (int(ax + (bx - ax) * t1), int(ay + (by - ay) * t1)),
+                         bgr, thick, cv2.LINE_AA)
+        seg(x1, y1, x2, y1); seg(x2, y1, x2, y2)
+        seg(x2, y2, x1, y2); seg(x1, y2, x1, y1)
 
     def _toggle_draw_shortcut(self):
         self.bbox_btn.setChecked(not self.bbox_btn.isChecked())
@@ -4714,9 +4921,18 @@ class MainWindow(QMainWindow):
         key = ev.key()
         K = Qt.Key if _QT6 else Qt
 
+        if key == K.Key_Escape:
+            if self.bbox_btn.isChecked():
+                self.bbox_btn.setChecked(False)
+            elif self._selected_feature_idx is not None:
+                self._end_edit()
+            ev.accept()
+            return
         if not typing:
             if key in ((K.Key_Delete, K.Key_Backspace)):
-                if self._selected_feature_idx is not None:
+                # only delete a box that is visibly selected on this frame, so a
+                # stray Backspace can't remove something you can't see
+                if self._selected_bbox_on_frame(self.current_frame_idx) is not None:
                     self._delete_feature()
                     ev.accept()
                     return
@@ -4825,6 +5041,7 @@ class MainWindow(QMainWindow):
         s.video_note = snap.get("video_note", "")
         s.shark_log = snap.get("shark_log", [])
         self._selected_feature_idx = snap["sel"]
+        self._edit_undo_for = None     # next live edit gets its own undo step
         self._refresh_features()
         self._refresh_notes()
         self._refresh_clips()
@@ -5200,7 +5417,7 @@ class MainWindow(QMainWindow):
 
     def _cleanup_preloads(self):
         """Delete temp frame dirs of preloads that were never used."""
-        for prep in self._preload.values():
+        for prep in list(self._preload.values()):   # worker may still insert
             td = prep.get("temp_dir")
             if td and os.path.isdir(td):
                 shutil.rmtree(td, ignore_errors=True)
@@ -6324,6 +6541,7 @@ class MainWindow(QMainWindow):
     def _show_help(self):
         QMessageBox.information(
             self, "CTAG Annotator — Shortcuts & help",
+            f"Version {APP_VERSION}\n\n"
             "KEYBOARD SHORTCUTS\n"
             "  ←/→  step 1 frame      Ctrl+←/→  jump 10 frames\n"
             "  Space  play/pause      B  arm Draw Bbox     C  focus Comment box\n"
@@ -6350,8 +6568,14 @@ class MainWindow(QMainWindow):
             "  • Logging again inside the same interaction replaces its entry.\n\n"
             "OTHER ANIMALS / BOUNDING BOXES\n"
             "  • Draw Bbox (or B), then click TWO corners (right-click cancels).\n"
-            "  • Click a box on the video to select it; drag its corners to edit;\n"
-            "    Delete removes it.\n"
+            "  • Each box belongs to the single frame it was drawn on. Within 1 s\n"
+            "    of it you'll see it DASHED with how far away it is — click the\n"
+            "    dashed box (or its row in the Boxes list) to jump right to it.\n"
+            "  • Click a box (video or list) to EDIT it: the panel turns yellow and\n"
+            "    any change to ID/count/confidence/name saves instantly. Drag its\n"
+            "    corners to resize. Esc / Done editing returns the panel to your\n"
+            "    settings for the next box. Delete removes the selected box\n"
+            "    (only when you can see it); ⌘Z brings it back.\n"
             "  • Identify at whatever rank you're sure of: type into Find (or\n"
             "    straight into Species) and Family/Genus back-fill themselves;\n"
             "    or fill only Family (or only Genus) and stop there. The panel\n"
@@ -6362,9 +6586,11 @@ class MainWindow(QMainWindow):
             "    show them on the timeline. Plus a whole-video note field.\n"
             "  • Mark In/Out → Save Clip → Export Clip (MP4, overlays optional).\n\n"
             "SAVING\n"
-            "  • Autosaves every 60 s to ~/CTAG_Annotator/annotations (local, so\n"
-            "    it's reliable even when the video streams from Google Drive).\n"
-            "    You're prompted to resume on reopen.")
+            "  • Autosaves ~2 s after every change to ~/CTAG_Annotator/annotations\n"
+            "    (local, so it's reliable even when the video streams from Google\n"
+            "    Drive). You're prompted to resume on reopen.\n"
+            "  • Problems? Error and crash reports are in ~/CTAG_Annotator/logs —\n"
+            "    send that folder to Mark.")
 
     # -------------------------------------------------------------- close
     def closeEvent(self, ev):
@@ -6421,11 +6647,21 @@ def _extract_frames(video_path: str, out_dir: str, show_progress: bool = True) -
         ok, frame = cap.read()
         if not ok:
             break
-        cv2.imwrite(
+        ok_w = cv2.imwrite(
             os.path.join(out_dir, f"{idx:05d}.jpg"),
             frame,
             [cv2.IMWRITE_JPEG_QUALITY, 95],
         )
+        if not ok_w:
+            # Almost always a full disk. Fail loudly instead of leaving a video
+            # with silently missing frames.
+            cap.release()
+            if dlg is not None:
+                dlg.close()
+            free = shutil.disk_usage(out_dir).free / 1e9
+            raise RuntimeError(
+                f"Could not write frame {idx} to the temporary folder "
+                f"({free:.1f} GB free). Free up disk space and try again.")
         idx += 1
         if dlg is not None:
             dlg.setValue(idx)
@@ -6478,6 +6714,11 @@ def prepare_source(path: str, is_frame_dir: bool, silent: bool = False) -> dict:
     cap.release()
 
     temp_dir = tempfile.mkdtemp(prefix="ctag_frames_")
+    try:  # owner marker so a later launch can sweep dirs left by a crash
+        with open(os.path.join(temp_dir, ".owner_pid"), "w") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
     try:
         n = _extract_frames(path, temp_dir, show_progress=not silent)
     except Exception as e:
@@ -6497,6 +6738,85 @@ def prepare_source(path: str, is_frame_dir: bool, silent: bool = False) -> dict:
     }
 
 
+def _sweep_stale_frame_dirs():
+    """Remove temp frame folders left behind by a crashed or killed session.
+
+    Each extracted video is ~GBs of JPEGs in the temp dir; normally they are
+    deleted on video switch / exit, but a crash leaks them, and a few leaks can
+    fill a laptop disk (which then breaks extraction and saving). Only folders
+    whose owning process is gone are removed; these are app-generated caches
+    of frames, never user data.
+    """
+    import glob, time
+    for d in glob.glob(os.path.join(tempfile.gettempdir(), "ctag_frames_*")):
+        try:
+            marker = os.path.join(d, ".owner_pid")
+            if os.path.exists(marker):
+                pid = int(open(marker).read().strip() or 0)
+                try:
+                    os.kill(pid, 0)
+                    continue            # owner still running
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    continue
+            elif time.time() - os.path.getmtime(d) < 24 * 3600:
+                continue                # pre-marker build; leave recent ones
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _log_path(name):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(LOG_DIR, name)
+
+
+_FAULT_FILE = None
+
+
+def _enable_fault_log():
+    """Record native crashes (segfaults/aborts) that no Python hook can catch.
+
+    Returns the text of a crash recorded by the PREVIOUS run, if any, after
+    archiving it, so the app can tell the user where it is.
+    """
+    global _FAULT_FILE
+    import faulthandler, time
+    path = _log_path("hard_crash.log")
+    previous = None
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            previous = open(path, errors="replace").read()[-4000:]
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            os.replace(path, _log_path(f"hard_crash_{stamp}.log"))
+    except OSError:
+        pass
+    try:
+        _FAULT_FILE = open(path, "w")
+        _FAULT_FILE.write(f"CTAG Annotator {APP_VERSION} pid {os.getpid()}\n")
+        _FAULT_FILE.flush()
+        faulthandler.enable(_FAULT_FILE, all_threads=True)
+    except Exception:
+        pass
+    return previous
+
+
+def _clear_fault_log():
+    """Clean exit → the header-only fault log is not a crash report."""
+    try:
+        if _FAULT_FILE is not None:
+            import faulthandler
+            faulthandler.disable()
+            _FAULT_FILE.close()
+            os.remove(_FAULT_FILE.name)
+    except Exception:
+        pass
+
+
 def _install_crash_guard():
     """Keep a Python error in a Qt slot from killing the whole app.
 
@@ -6514,8 +6834,19 @@ def _install_crash_guard():
             sys.__excepthook__(exc_type, exc, tb)
             return
         text = "".join(traceback.format_exception(exc_type, exc, tb))
-        sys.stderr.write(text)
-        sys.stderr.flush()
+        try:   # a windowed app bundle may have no usable stderr
+            if sys.stderr:
+                sys.stderr.write(text)
+                sys.stderr.flush()
+        except Exception:
+            pass
+        try:   # keep a permanent record for bug reports
+            import time
+            with open(_log_path("errors.log"), "a") as fh:
+                fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                         f"v{APP_VERSION} ===\n{text}")
+        except Exception:
+            pass
         saved_to = None
         try:  # emergency save before anything else can go wrong
             for w in QApplication.topLevelWidgets():
@@ -6536,7 +6867,8 @@ def _install_crash_guard():
                 None, "Something went wrong",
                 "The annotator hit an internal error, but it has NOT closed "
                 "and your annotations are intact." + note +
-                "\n\nPlease send this to Mark:\n\n" + text[-1200:])
+                "\n\nPlease send Mark the file:\n" + _log_path("errors.log") +
+                "\n\n" + text[-1000:])
         except Exception:
             pass
         finally:
@@ -6576,6 +6908,9 @@ def main():
     _enable_hidpi()
     app = QApplication(sys.argv)
     _install_crash_guard()
+    previous_crash = _enable_fault_log()
+    app.aboutToQuit.connect(_clear_fault_log)
+    _sweep_stale_frame_dirs()
 
     try:
         app.setStyle("Fusion")
@@ -6611,8 +6946,12 @@ def main():
 
     try:
         prep = prepare_source(chosen, is_frame_dir)
-    except RuntimeError as e:
-        sys.exit(str(e))
+    except Exception as e:
+        # sys.exit(message) is invisible in the app bundle — the window just
+        # never appeared, which looked exactly like a crash.
+        QMessageBox.critical(None, "Could not open video",
+                             f"{os.path.basename(str(chosen))}\n\n{e}")
+        sys.exit(1)
 
     print(f"Opening annotator: {prep['frames_source']}  "
           f"({prep['total_frames']} frames @ {prep['fps']:.2f} fps)")
@@ -6647,6 +6986,11 @@ def main():
     else:
         win.resize(1200, 800)
     win.show()
+    if previous_crash:
+        QTimer.singleShot(400, lambda: QMessageBox.warning(
+            win, "The annotator closed unexpectedly last time",
+            "Your autosaved work is kept and will be offered when you reopen "
+            "that video.\n\nPlease send Mark the crash report in:\n" + LOG_DIR))
     sys.exit(app.exec())
 
 

@@ -113,6 +113,138 @@ def _():
     assert len(w.store.features) == 3
 
 
+print("\n== finding & editing placed boxes ==")
+
+from PyQt6.QtCore import Qt, QEvent
+from PyQt6.QtGui import QKeyEvent
+
+def press(w, key):
+    w.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier))
+
+def box_center_label(w, fi, frame):
+    x1, y1, x2, y2 = w.store.feature_bboxes[fi][frame]
+    lx, ly = w._video_to_label((x1 + x2) // 2, (y1 + y2) // 2)
+    return QPoint(int(lx), int(ly))
+
+@check("a box stays findable when you come back a frame off")
+def _():
+    w = win(labeling=False); w.seek_to(4); draw_box(w)
+    w.seek_to(5)                                   # one frame past it
+    near = w._nearby_boxes(5)
+    assert [(i, f) for i, f, _ in near] == [(0, 4)], near
+    w._on_video_click(box_center_label(w, 0, 4))   # click the dashed box
+    assert w.current_frame_idx == 4 and w._selected_feature_idx == 0
+
+@check("picking a box in the list jumps to its frame")
+def _():
+    w = win(labeling=False); w.seek_to(2); draw_box(w); w.seek_to(8)
+    w.feat_list.setCurrentRow(0)
+    assert w.current_frame_idx == 2 and w._selected_feature_idx == 0
+    assert w.video_label._edit_rect is not None     # corner handles shown
+
+@check("edits to a selected box apply live, and undo as one step")
+def _():
+    w = win(labeling=False)
+    w.category_combo.setCurrentText("Teleost fish")
+    draw_box(w)
+    w.feat_list.setCurrentRow(0)
+    w.taxon.set_value("Lutjanidae", "", "", ""); w.taxon.changed.emit()
+    w.count_spin.setValue(7)
+    w.confidence_combo.setCurrentText("High")
+    f = w.store.features[0]
+    assert (f.family, f.count, f.confidence) == ("Lutjanidae", 7, "High"), (f.family, f.count, f.confidence)
+    assert "×7" in w.feat_list.item(0).text()
+    w._undo()
+    f = w.store.features[0]
+    assert (f.family, f.count) == ("", 1), (f.family, f.count)
+
+@check("preparing the next box never changes the one just drawn")
+def _():
+    w = win(labeling=False)
+    w.category_combo.setCurrentText("Teleost fish")
+    w.taxon.set_value("Serranidae", "", "", ""); draw_box(w)
+    assert w._selected_feature_idx is None
+    w.taxon.set_value("Haemulidae", "", "", ""); w.taxon.changed.emit()
+    w.count_spin.setValue(4)
+    assert w.store.features[0].family == "Serranidae" and w.store.features[0].count == 1
+
+@check("leaving edit mode restores the next-box settings")
+def _():
+    w = win(labeling=False)
+    w.category_combo.setCurrentText("Teleost fish")
+    w.taxon.set_value("Serranidae", "", "", ""); draw_box(w)
+    w.taxon.set_value("Haemulidae", "", "", ""); w.count_spin.setValue(3)
+    w.feat_list.setCurrentRow(0)                   # fields now show the box
+    assert w.taxon.value()["family"] == "Serranidae"
+    press(w, Qt.Key.Key_Escape)
+    assert w._selected_feature_idx is None
+    assert w.taxon.value()["family"] == "Haemulidae" and w.count_spin.value() == 3
+    w.bbox_btn.setChecked(True); draw_box(w, 1)
+    assert w.store.features[1].family == "Haemulidae"
+    assert w.store.features[0].family == "Serranidae"
+
+@check("arming Draw leaves edit mode")
+def _():
+    w = win(labeling=False); draw_box(w); w.feat_list.setCurrentRow(0)
+    w.bbox_btn.setChecked(True)
+    assert w._selected_feature_idx is None
+
+@check("Backspace can't delete a box you can't see")
+def _():
+    w = win(labeling=False); w.seek_to(3); draw_box(w)
+    press(w, Qt.Key.Key_Backspace)                 # nothing selected
+    assert len(w.store.features) == 1
+    w.feat_list.setCurrentRow(0); w.seek_to(6)     # selected, but off-frame
+    press(w, Qt.Key.Key_Backspace)
+    assert len(w.store.features) == 1
+    w.seek_to(3); press(w, Qt.Key.Key_Backspace)   # visible → deletes
+    assert len(w.store.features) == 0
+    w._undo(); assert len(w.store.features) == 1
+
+@check("selection survives list rebuilds (draw elsewhere, undo)")
+def _():
+    w = win(labeling=False); draw_box(w); draw_box(w, 1)
+    w.feat_list.setCurrentRow(1)
+    w.count_spin.setValue(5)
+    w._refresh_features()
+    assert w._selected_feature_idx == 1 and w.feat_list.currentRow() == 1
+
+
+print("\n== crash diagnostics ==")
+
+@check("errors are written to the log file")
+def _():
+    import sys as _s
+    ra._install_crash_guard()
+    try:
+        raise ValueError("log me")
+    except ValueError:
+        _s.excepthook(*_s.exc_info())
+    log = open(ra._log_path("errors.log")).read()
+    assert "log me" in log and ra.APP_VERSION in log
+
+@check("a crash report from the last run is surfaced, then archived")
+def _():
+    path = ra._log_path("hard_crash.log")
+    open(path, "w").write("Fatal Python error: Segmentation fault\n")
+    prev = ra._enable_fault_log()
+    assert prev and "Segmentation fault" in prev
+    ra._clear_fault_log()
+    assert not os.path.exists(path)
+    assert any(n.startswith("hard_crash_") for n in os.listdir(ra.LOG_DIR))
+
+@check("frame folders leaked by a crash are swept, live ones kept")
+def _():
+    base = tempfile.gettempdir()
+    dead = tempfile.mkdtemp(prefix="ctag_frames_", dir=base)
+    live = tempfile.mkdtemp(prefix="ctag_frames_", dir=base)
+    open(os.path.join(dead, ".owner_pid"), "w").write("999999")
+    open(os.path.join(live, ".owner_pid"), "w").write(str(os.getpid()))
+    ra._sweep_stale_frame_dirs()
+    assert not os.path.exists(dead) and os.path.exists(live)
+    shutil.rmtree(live)
+
+
 print("\n== labels ==")
 
 @check("visibility is the 5-point scale")

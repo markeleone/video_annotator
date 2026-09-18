@@ -9,7 +9,8 @@ on the `annotator-only` branch.
 ```bash
 .venv/bin/python run_annotator.py                 # startup chooser
 .venv/bin/python run_annotator.py --frames-dir DIR
-.venv/bin/python tests/test_annotator.py          # 22-test headless suite
+.venv/bin/python tests/test_annotator.py          # 33-test headless suite
+.venv/bin/python tests/fuzz_annotator.py 3000 1   # random-action stress test (steps, seed)
 ```
 
 Build the shareable Mac app (see "Build gotchas" below):
@@ -25,9 +26,10 @@ Build the shareable Mac app (see "Build gotchas" below):
 |---|---|
 | `run_annotator.py` | The entire app (single file, ~6.5k lines). |
 | `tests/test_annotator.py` | Headless regression suite; Qt runs offscreen. |
+| `tests/fuzz_annotator.py` | Random-action stress test; reuses the suite's bootstrap. |
 | `annotator.spec` | PyInstaller spec (hiddenimports incl. openpyxl). |
 | `dist/CTAG Annotator.zip` | Built app for collaborators (git-ignored). |
-| `~/CTAG_Annotator/` | **User config**, not in the repo: `taxonomy.csv`, `behaviors.csv`, `habitats.csv`, `settings.json`, `recent.json`, and `annotations/`. |
+| `~/CTAG_Annotator/` | **User config**, not in the repo: `taxonomy.csv`, `behaviors.csv`, `habitats.csv`, `settings.json`, `recent.json`, `annotations/`, and `logs/` (`errors.log`, `hard_crash*.log` — ask for this folder with any bug report). |
 
 ## Data model
 
@@ -62,6 +64,17 @@ never assume a field exists.
   next. A fresh video starts blank (so an accidental scrub records nothing);
   seeking onto a labeled frame adopts that label; seeking over blank frames
   keeps your selection. "None" sets the pen to erase.
+- **Boxes are single-frame.** A box exists only on the frame it was drawn.
+  To stop them "vanishing", boxes within ±1 s are drawn dashed and are
+  clickable (jump + select). Multi-frame boxes/tracks were deliberately not
+  added — it changes the data model and exports.
+- **Editing a box is a mode.** Clicking a box enters edit mode (yellow
+  banner); field changes apply live, one undo step per session; Esc/Done
+  exits and restores the stashed next-box settings. A newly drawn box is
+  NOT auto-selected (else prepping the next ID would rewrite it). Delete key
+  only acts on a box visible on the current frame.
+- **Bump `APP_VERSION`** with every shared build — it goes into Help and the
+  logs, and is how we tell whether a bug report is from an old zip.
 - **Saves are always local.** Autosave writes to `~/CTAG_Annotator/annotations/`,
   never next to the video — writes into a Google Drive File Provider mount fail
   silently. `is_cloud_path()` also redirects the Save-JSON default.
